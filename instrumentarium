@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+# Instrumentarium - Launcher
+
+# Locate the Python script relative to this wrapper
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GUI_SCRIPT="$SCRIPT_DIR/instrumentarium.py"
+
+if [ ! -f "$GUI_SCRIPT" ]; then
+    echo "Error: Cannot find instrumentarium.py in $SCRIPT_DIR"
+    exit 1
+fi
+
+# Run the PyQt6 application
+exec python3 "$GUI_SCRIPT" "$@"
