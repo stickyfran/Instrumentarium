@@ -729,6 +729,7 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                     os.path.join("users", user_name, "AppData", "Roaming", p["vendor"]),
                     os.path.join("users", user_name, "AppData", "Local", p["vendor"]),
                     os.path.join("users", user_name, "Documents", p["vendor"]),
+                    os.path.join("users", "Public", "Documents", p["vendor"]),
                     os.path.join("ProgramData", p["vendor"]),
                 ]:
                     src_sub = os.path.join(drive_c_src, sub)
@@ -827,20 +828,26 @@ if exist "drive_c\ProgramData" (
     echo   [OK] ProgramData actualizado.
 )
 
-:: 5. Copiar datos de usuario (AppData / Documents)
-echo [5/6] Copiando presets y configuraciones de usuario...
+:: 5. Copiar datos de usuario (AppData / Documents / Public Documents)
+echo [5/6] Copiando presets, librerias y configuraciones de usuario...
+if exist "drive_c\users\Public\Documents" (
+    if not exist "%PUBLIC%\Documents" mkdir "%PUBLIC%\Documents"
+    xcopy /E /I /Y "drive_c\users\Public\Documents\*" "%PUBLIC%\Documents\" >nul
+)
 for /D %%U in ("drive_c\users\*") do (
-    if exist "%%U\AppData\Roaming" (
-        xcopy /E /I /Y "%%U\AppData\Roaming\*" "%APPDATA%\" >nul
-    )
-    if exist "%%U\AppData\Local" (
-        xcopy /E /I /Y "%%U\AppData\Local\*" "%LOCALAPPDATA%\" >nul
-    )
-    if exist "%%U\Documents" (
-        xcopy /E /I /Y "%%U\Documents\*" "%USERPROFILE%\Documents\" >nul
+    if /I not "%%~nxU"=="Public" if /I not "%%~nxU"=="Default" (
+        if exist "%%U\AppData\Roaming" (
+            xcopy /E /I /Y "%%U\AppData\Roaming\*" "%APPDATA%\" >nul
+        )
+        if exist "%%U\AppData\Local" (
+            xcopy /E /I /Y "%%U\AppData\Local\*" "%LOCALAPPDATA%\" >nul
+        )
+        if exist "%%U\Documents" (
+            xcopy /E /I /Y "%%U\Documents\*" "%USERPROFILE%\Documents\" >nul
+        )
     )
 )
-echo   [OK] AppData y Documents actualizados.
+echo   [OK] Presets, samples y librerias de usuario actualizados.
 
 :: 6. Inyectar Registro de Windows
 if exist "registry.reg" (
