@@ -942,11 +942,14 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Instrumentarium - Gestor de Plugins VST")
         self.setWindowIcon(get_system_icon("instrumentarium", "🎛️"))
-        self.resize(980, 720)
-        self.setMinimumSize(820, 560)
+        self.is_windows = (sys.platform == "win32")
+        if self.is_windows:
+            self.wine_prefix = os.environ.get("SystemDrive", "C:") + "\\"
+            self.wine_root = ""
+        else:
+            self.wine_prefix = get_wine_prefix()
+            self.wine_root = get_wine_root()
 
-        self.wine_prefix = get_wine_prefix()
-        self.wine_root = get_wine_root()
         self.queue_items = []
         self.temp_dirs = []
         self.installed_products = []
@@ -1370,7 +1373,8 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
     def get_drive_c(self):
         if hasattr(self, "is_windows") and self.is_windows:
             return os.environ.get("SystemDrive", "C:") + "\\"
-        return self.get_drive_c()
+        return os.path.join(self.wine_prefix, "drive_c")
+
     def refresh_installed_ecosystem(self):
         vst3_dir = os.path.join(self.get_drive_c(), "Program Files", "Common Files", "VST3")
         vst2_dir = os.path.join(self.get_drive_c(), "Program Files", "VSTPlugins")
