@@ -68,6 +68,38 @@ def get_wine_root() -> str:
     return ""
 
 
+
+def get_drive_c_path(wine_prefix: str, is_windows: bool = False) -> str:
+    if is_windows or sys.platform == "win32":
+        return os.environ.get("SystemDrive", "C:") + "\\\\"
+    return os.path.join(wine_prefix, "drive_c")
+
+
+def is_product_tracked(product: dict, wine_prefix: str) -> bool:
+    tracker_dir = os.path.join(wine_prefix, ".vst_tracker")
+    if not os.path.isdir(tracker_dir):
+        return False
+    
+    p_files_set = set(product.get("files", []))
+    p_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', product.get("name", "")).lower()
+    
+    try:
+        for rf in os.listdir(tracker_dir):
+            if rf.endswith(".json"):
+                rf_clean = rf.lower()
+                if p_name_clean and (rf_clean.startswith(p_name_clean) or p_name_clean in rf_clean):
+                    return True
+                try:
+                    with open(os.path.join(tracker_dir, rf), "r", encoding="utf-8") as f_rf:
+                        rdata = json.load(f_rf)
+                        r_files = set(rdata.get("new_files", []))
+                        if p_files_set.intersection(r_files):
+                            return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
 def human_readable_size(size_bytes: int) -> str:
     if size_bytes < 1024:
         return f"{size_bytes} B"
@@ -603,123 +635,118 @@ class InstallWorker(QtCore.QThread):
         self.finished.emit()
 
 
-class ExportWorker(QtCore.QThread):
-    progress = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal(bool, str)
+def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_windows=False):
+    temp_dir = tempfile.mkdtemp(prefix="vstpack_build_")
+    try:
+        drive_dest = os.path.join(temp_dir, "drive_c")
+        os.makedirs(drive_dest, exist_ok=True)
 
-    def __init__(self, target_archive, products, wine_prefix, wine_root):
-        super().__init__()
-        self.target_archive = target_archive
-        self.products = products
-        self.wine_prefix = wine_prefix
-        self.wine_root = wine_root
+        manifest = {
+            "format_version": "2.0",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "source_os": "Windows (Native)" if is_windows else "Linux (Wine)",
+            "compatibility": ["Linux (Instrumentarium)", "Windows 10/11 (Native)"],
+            "source_prefix": wine_prefix,
+            "products": []
+        }
 
-    def run(self):
-        try:
-            temp_dir = tempfile.mkdtemp(prefix="vstpack_build_")
-            drive_dest = os.path.join(temp_dir, "drive_c")
-            os.makedirs(drive_dest, exist_ok=True)
+        keys_to_export = set()
+        tracker_dir = os.path.join(wine_prefix, ".vst_tracker")
+        receipts = []
+        if os.path.isdir(tracker_dir):
+            for rf in os.listdir(tracker_dir):
+                if rf.endswith(".json"):
+                    try:
+                        with open(os.path.join(tracker_dir, rf), "r", encoding="utf-8") as f:
+                            receipts.append(json.load(f))
+                    except Exception:
+                        pass
 
-            manifest = {
-                "format_version": "2.0",
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "source_os": "Linux (Wine)",
-                "compatibility": ["Linux (Instrumentarium)", "Windows 10/11 (Native)"],
-                "source_prefix": self.wine_prefix,
-                "products": []
+        drive_c_src = get_drive_c_path(wine_prefix, is_windows)
+
+        for p in products:
+            p_entry = {
+                "name": p["name"],
+                "vendor": p["vendor"],
+                "formats": p["formats"],
+                "version": p["version"],
+                "files": []
             }
+            
+            p_files_set = set(p.get("files", []))
+            p_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', p.get("name", "")).lower()
 
-            keys_to_export = set()
-            tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
-            receipts = []
-            if os.path.isdir(tracker_dir):
-                for rf in os.listdir(tracker_dir):
-                    if rf.endswith(".json"):
-                        try:
-                            with open(os.path.join(tracker_dir, rf), "r", encoding="utf-8") as f:
-                                receipts.append(json.load(f))
-                        except Exception:
-                            pass
+            for r in receipts:
+                r_files = r.get("new_files", [])
+                r_installer = r.get("installer", "").lower()
+                match = any(f in p_files_set for f in r_files) or (p_name_clean and p_name_clean in r_installer)
+                if match:
+                    for f in r_files:
+                        if f not in p["files"] and os.path.exists(f):
+                            p["files"].append(f)
+                    for line in r.get("reg_diff", []):
+                        line = line.strip()
+                        if line.startswith("[") and line.endswith("]"):
+                            path = line[1:-1]
+                            parts = path.split("\\")
+                            if len(parts) >= 2 and parts[0] == "Software":
+                                vendor = parts[1]
+                                if vendor.lower() not in ["classes", "microsoft", "wine", "wow6432node"]:
+                                    keys_to_export.add(f"Software\\{vendor}")
+                                else:
+                                    keys_to_export.add(path)
 
-            for p in self.products:
-                self.progress.emit(f"Exportando: {p['name']}...")
-                p_entry = {
-                    "name": p["name"],
-                    "vendor": p["vendor"],
-                    "formats": p["formats"],
-                    "version": p["version"],
-                    "files": []
-                }
-                
-                # Match tracker receipts
-                p_files_set = set(p["files"])
-                for r in receipts:
-                    r_files = r.get("new_files", [])
-                    if any(f in p_files_set for f in r_files):
-                        p["files"].extend([f for f in r_files if f not in p_files_set])
-                        for line in r.get("reg_diff", []):
-                            line = line.strip()
-                            if line.startswith("[") and line.endswith("]"):
-                                path = line[1:-1]
-                                parts = path.split("\\")
-                                if len(parts) >= 2 and parts[0] == "Software":
-                                    vendor = parts[1]
-                                    if vendor.lower() not in ["classes", "microsoft", "wine", "wow6432node"]:
-                                        keys_to_export.add(f"Software\\{vendor}")
-                                    else:
-                                        keys_to_export.add(path)
+            if p["vendor"] and p["vendor"] != "Desconocido":
+                keys_to_export.add(f"Software\\{p['vendor']}")
 
-                if p["vendor"] and p["vendor"] != "Desconocido":
-                    keys_to_export.add(f"Software\\{p['vendor']}")
+            for fpath in p["files"]:
+                if os.path.exists(fpath):
+                    rel = os.path.relpath(fpath, drive_c_src)
+                    if rel.startswith(".."):
+                        continue
+                    dest_file = os.path.join(drive_dest, rel)
+                    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                    if os.path.isdir(fpath):
+                        if os.path.exists(dest_file):
+                            shutil.rmtree(dest_file)
+                        shutil.copytree(fpath, dest_file)
+                    else:
+                        shutil.copy2(fpath, dest_file)
+                    if rel not in p_entry["files"]:
+                        p_entry["files"].append(rel)
 
-                for fpath in p["files"]:
-                    if os.path.exists(fpath):
-                        rel = os.path.relpath(fpath, self.get_drive_c())
-                        # Skip if it's outside drive_c (e.g. symlinks leading outside)
-                        if rel.startswith(".."):
-                            continue
-                        dest_file = os.path.join(drive_dest, rel)
-                        os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                        if os.path.isdir(fpath):
-                            if os.path.exists(dest_file):
-                                shutil.rmtree(dest_file)
-                            shutil.copytree(fpath, dest_file)
+            if p["vendor"] and p["vendor"] != "Desconocido":
+                user_name = os.environ.get("USER", "kes")
+                for sub in [
+                    os.path.join("users", user_name, "AppData", "Roaming", p["vendor"]),
+                    os.path.join("users", user_name, "AppData", "Local", p["vendor"]),
+                    os.path.join("users", user_name, "Documents", p["vendor"]),
+                    os.path.join("ProgramData", p["vendor"]),
+                ]:
+                    src_sub = os.path.join(drive_c_src, sub)
+                    if os.path.exists(src_sub):
+                        dest_sub = os.path.join(drive_dest, sub)
+                        os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
+                        if os.path.isdir(src_sub):
+                            if not os.path.exists(dest_sub):
+                                shutil.copytree(src_sub, dest_sub)
                         else:
-                            shutil.copy2(fpath, dest_file)
-                        if rel not in p_entry["files"]:
-                            p_entry["files"].append(rel)
+                            shutil.copy2(src_sub, dest_sub)
 
-                if p["vendor"] and p["vendor"] != "Desconocido":
-                    for sub in [
-                        os.path.join("users", os.environ.get("USER", "kes"), "AppData", "Roaming", p["vendor"]),
-                        os.path.join("users", os.environ.get("USER", "kes"), "AppData", "Local", p["vendor"]),
-                        os.path.join("users", os.environ.get("USER", "kes"), "Documents", p["vendor"]),
-                        os.path.join("ProgramData", p["vendor"]),
-                    ]:
-                        src_sub = os.path.join(self.get_drive_c(), sub)
-                        if os.path.exists(src_sub):
-                            dest_sub = os.path.join(drive_dest, sub)
-                            os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
-                            if os.path.isdir(src_sub):
-                                if not os.path.exists(dest_sub):
-                                    shutil.copytree(src_sub, dest_sub)
-                            else:
-                                shutil.copy2(src_sub, dest_sub)
+            manifest["products"].append(p_entry)
 
-                manifest["products"].append(p_entry)
+        # Export Registry
+        reg_file = os.path.join(temp_dir, "registry.reg")
+        with open(reg_file, "w", encoding="utf-8") as rf:
+            rf.write("Windows Registry Editor Version 5.00\n\n")
 
-            # Export Registry for collected keys
-            reg_file = os.path.join(temp_dir, "registry.reg")
-            with open(reg_file, "w", encoding="utf-8") as rf:
-                rf.write("Windows Registry Editor Version 5.00\n\n")
-
-            wine_bin = os.path.join(self.wine_root, "bin", "wine")
+        if not is_windows and wine_root:
+            wine_bin = os.path.join(wine_root, "bin", "wine")
             env = os.environ.copy()
-            env["WINEPREFIX"] = self.wine_prefix
+            env["WINEPREFIX"] = wine_prefix
             env["WINEDEBUG"] = "-all"
 
             for base_key in keys_to_export:
-                self.progress.emit(f"Exportando registro: {base_key}...")
                 k_clean = re.sub(r'[^a-zA-Z0-9_]', '_', base_key)
                 for hive in ["HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"]:
                     full_key = f"{hive}\\{base_key}"
@@ -749,15 +776,12 @@ class ExportWorker(QtCore.QThread):
                         with open(reg_file, "a", encoding="utf-8") as rf:
                             rf.write(f"\n; --- {full_key} ---\n" + content + "\n")
 
-            # Write manifest.json
-            with open(os.path.join(temp_dir, "manifest.json"), "w", encoding="utf-8") as mf:
-                json.dump(manifest, mf, indent=2)
+        # Write manifest.json
+        with open(os.path.join(temp_dir, "manifest.json"), "w", encoding="utf-8") as mf:
+            json.dump(manifest, mf, indent=2)
 
-            # ----------------------------------------------------
-            # CROSS-PLATFORM: Generate Windows & Linux Installers
-            # ----------------------------------------------------
-            # 1. Windows batch installer (install_windows.bat)
-            bat_content = """@echo off
+        # 1. install_windows.bat
+        bat_content = r"""@echo off
 title Instrumentarium VSTPack - Windows Installer
 echo ========================================================
 echo   Instrumentarium VSTPack - Instalador de Plugins para Windows
@@ -765,47 +789,47 @@ echo ========================================================
 echo.
 
 :: 1. Copiar VST3
-if exist "drive_c\\Program Files\\Common Files\\VST3" (
+if exist "drive_c\Program Files\Common Files\VST3" (
     echo [1/6] Copiando plugins VST3...
-    if not exist "%CommonProgramFiles%\\VST3" mkdir "%CommonProgramFiles%\\VST3"
-    xcopy /E /I /Y "drive_c\\Program Files\\Common Files\\VST3\\*" "%CommonProgramFiles%\\VST3\\" >nul
-    echo   [OK] VST3 instalados en %CommonProgramFiles%\\VST3
+    if not exist "%CommonProgramFiles%\VST3" mkdir "%CommonProgramFiles%\VST3"
+    xcopy /E /I /Y "drive_c\Program Files\Common Files\VST3\*" "%CommonProgramFiles%\VST3\" >nul
+    echo   [OK] VST3 instalados en %CommonProgramFiles%\VST3
 )
 
 :: 2. Copiar VST2 (x64)
-if exist "drive_c\\Program Files\\VSTPlugins" (
+if exist "drive_c\Program Files\VSTPlugins" (
     echo [2/6] Copiando plugins VST2 (x64)...
-    if not exist "%ProgramFiles%\\VSTPlugins" mkdir "%ProgramFiles%\\VSTPlugins"
-    xcopy /E /I /Y "drive_c\\Program Files\\VSTPlugins\\*" "%ProgramFiles%\\VSTPlugins\\" >nul
-    echo   [OK] VST2 instalados en %ProgramFiles%\\VSTPlugins
+    if not exist "%ProgramFiles%\VSTPlugins" mkdir "%ProgramFiles%\VSTPlugins"
+    xcopy /E /I /Y "drive_c\Program Files\VSTPlugins\*" "%ProgramFiles%\VSTPlugins\" >nul
+    echo   [OK] VST2 instalados en %ProgramFiles%\VSTPlugins
 )
 
 :: 3. Copiar CLAP
-if exist "drive_c\\Program Files\\Common Files\\CLAP" (
+if exist "drive_c\Program Files\Common Files\CLAP" (
     echo [3/6] Copiando plugins CLAP...
-    if not exist "%CommonProgramFiles%\\CLAP" mkdir "%CommonProgramFiles%\\CLAP"
-    xcopy /E /I /Y "drive_c\\Program Files\\Common Files\\CLAP\\*" "%CommonProgramFiles%\\CLAP\\" >nul
-    echo   [OK] CLAP instalados en %CommonProgramFiles%\\CLAP
+    if not exist "%CommonProgramFiles%\CLAP" mkdir "%CommonProgramFiles%\CLAP"
+    xcopy /E /I /Y "drive_c\Program Files\Common Files\CLAP\*" "%CommonProgramFiles%\CLAP\" >nul
+    echo   [OK] CLAP instalados en %CommonProgramFiles%\CLAP
 )
 
 :: 4. Copiar ProgramData
-if exist "drive_c\\ProgramData" (
+if exist "drive_c\ProgramData" (
     echo [4/6] Copiando datos compartidos a ProgramData...
-    xcopy /E /I /Y "drive_c\\ProgramData\\*" "%ProgramData%\\" >nul
+    xcopy /E /I /Y "drive_c\ProgramData\*" "%ProgramData%\" >nul
     echo   [OK] ProgramData actualizado.
 )
 
 :: 5. Copiar datos de usuario (AppData / Documents)
 echo [5/6] Copiando presets y configuraciones de usuario...
-for /D %%U in ("drive_c\\users\\*") do (
-    if exist "%%U\\AppData\\Roaming" (
-        xcopy /E /I /Y "%%U\\AppData\\Roaming\\*" "%APPDATA%\\" >nul
+for /D %%U in ("drive_c\users\*") do (
+    if exist "%%U\AppData\Roaming" (
+        xcopy /E /I /Y "%%U\AppData\Roaming\*" "%APPDATA%\" >nul
     )
-    if exist "%%U\\AppData\\Local" (
-        xcopy /E /I /Y "%%U\\AppData\\Local\\*" "%LOCALAPPDATA%\\" >nul
+    if exist "%%U\AppData\Local" (
+        xcopy /E /I /Y "%%U\AppData\Local\*" "%LOCALAPPDATA%\" >nul
     )
-    if exist "%%U\\Documents" (
-        xcopy /E /I /Y "%%U\\Documents\\*" "%USERPROFILE%\\Documents\\" >nul
+    if exist "%%U\Documents" (
+        xcopy /E /I /Y "%%U\Documents\*" "%USERPROFILE%\Documents\" >nul
     )
 )
 echo   [OK] AppData y Documents actualizados.
@@ -824,11 +848,11 @@ echo ========================================================
 echo Abre Ableton Live, ve a Preferencias ^> Plug-ins y reescanea.
 pause
 """
-            with open(os.path.join(temp_dir, "install_windows.bat"), "w", encoding="latin-1", errors="ignore") as bf:
-                bf.write(bat_content)
+        with open(os.path.join(temp_dir, "install_windows.bat"), "w", encoding="latin-1", errors="ignore") as bf:
+            bf.write(bat_content)
 
-            # 2. Linux Shell installer (install_linux.sh)
-            sh_content = """#!/usr/bin/env bash
+        # 2. install_linux.sh
+        sh_content = r"""#!/usr/bin/env bash
 # Instrumentarium VSTPack - Standalone Linux Restore Script
 set -euo pipefail
 
@@ -864,13 +888,13 @@ echo "========================================================"
 echo "  Restauracion finalizada con exito en Linux!"
 echo "========================================================"
 """
-            sh_path = os.path.join(temp_dir, "install_linux.sh")
-            with open(sh_path, "w", encoding="utf-8") as sf:
-                sf.write(sh_content)
-            os.chmod(sh_path, 0o755)
+        sh_path = os.path.join(temp_dir, "install_linux.sh")
+        with open(sh_path, "w", encoding="utf-8") as sf:
+            sf.write(sh_content)
+        os.chmod(sh_path, 0o755)
 
-            # 3. Readme instructions
-            readme_content = """# Instrumentarium VSTPack - Paquete de Plugins Multiplataforma
+        # 3. Readme
+        readme_content = f"""# Instrumentarium VSTPack: {', '.join(p['name'] for p in products)}
 
 Este paquete contiene plugins VST2, VST3, CLAP, presets, datos de usuario y registros de Windows exportados desde Instrumentarium.
 
@@ -884,36 +908,64 @@ Este paquete contiene plugins VST2, VST3, CLAP, presets, datos de usuario y regi
    O ejecuta en terminal: `./install_linux.sh`
 2. Abre Ableton Live en Linux y mantén presionado Alt + Rescan.
 """
-            with open(os.path.join(temp_dir, "README.txt"), "w", encoding="utf-8") as rmf:
-                rmf.write(readme_content)
+        with open(os.path.join(temp_dir, "README.txt"), "w", encoding="utf-8") as rmf:
+            rmf.write(readme_content)
 
-            self.progress.emit("Comprimiendo paquete multiplataforma .vstpack...")
+        zip_path = target_archive if target_archive.endswith((".zip", ".vstpack")) else f"{target_archive}.vstpack"
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(temp_dir):
+                for f in files:
+                    full_f = os.path.join(root, f)
+                    rel_f = os.path.relpath(full_f, temp_dir)
+                    zf.write(full_f, rel_f)
 
-            # Compress as standard ZIP container (100% native on Windows & Linux)
-            # If target ends with .tar.zst or .tar.gz, use tar
-            if self.target_archive.endswith((".tar.zst", ".tar.gz")):
-                if self.target_archive.endswith(".zst") and shutil.which("zstd"):
-                    subprocess.run(["tar", "-C", temp_dir, "-I", "zstd", "-cf", self.target_archive, "."], check=True)
-                else:
-                    subprocess.run(["tar", "-C", temp_dir, "-czf", self.target_archive, "."], check=True)
+        return zip_path
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class ExportWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(bool, str)
+
+    def __init__(self, target_path, products, wine_prefix, wine_root, mode="monolithic", is_windows=False):
+        super().__init__()
+        self.target_path = target_path
+        self.products = products
+        self.wine_prefix = wine_prefix
+        self.wine_root = wine_root
+        self.mode = mode
+        self.is_windows = is_windows
+
+    def run(self):
+        try:
+            if self.mode == "individual_folder":
+                os.makedirs(self.target_path, exist_ok=True)
+                total = len(self.products)
+                exported_names = []
+                for idx, p in enumerate(self.products, start=1):
+                    clean_name = re.sub(r'[/\:*?"<>|]', '_', p["name"]).strip()
+                    self.progress.emit(f"Exportando ({idx}/{total}): {p['name']}.vstpack...")
+                    target_file = os.path.join(self.target_path, f"{clean_name}.vstpack")
+                    create_vstpack_bundle(target_file, [p], self.wine_prefix, self.wine_root, self.is_windows)
+                    exported_names.append(f"{clean_name}.vstpack")
+
+                summary_path = os.path.join(self.target_path, "backup_manifest.json")
+                with open(summary_path, "w", encoding="utf-8") as sf:
+                    json.dump({
+                        "backup_date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "total_packages": total,
+                        "packages": exported_names
+                    }, sf, indent=2)
+
+                self.finished.emit(True, self.target_path)
             else:
-                # Default: Standard ZIP archive (fully readable by Windows Explorer & 7-Zip)
-                zip_path = self.target_archive if self.target_archive.endswith((".zip", ".vstpack")) else f"{self.target_archive}.vstpack"
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    for root, _, files in os.walk(temp_dir):
-                        for f in files:
-                            full_f = os.path.join(root, f)
-                            rel_f = os.path.relpath(full_f, temp_dir)
-                            zf.write(full_f, rel_f)
-                self.target_archive = zip_path
-
-            self.finished.emit(True, self.target_archive)
+                self.progress.emit("Generando paquete consolidado...")
+                res_path = create_vstpack_bundle(self.target_path, self.products, self.wine_prefix, self.wine_root, self.is_windows)
+                self.finished.emit(True, res_path)
         except Exception as e:
             self.finished.emit(False, str(e))
-        finally:
-            if 'temp_dir' in locals() and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
 
 class DropArea(QtWidgets.QFrame):
     files_dropped = QtCore.pyqtSignal(list)
@@ -1090,14 +1142,15 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         # Products Table
         self.prod_table = QtWidgets.QTableWidget()
-        self.prod_table.setColumnCount(6)
-        self.prod_table.setHorizontalHeaderLabels(["Producto / Plugin", "Fabricante", "Formatos", "Standalone", "Versión", "Tamaño Total"])
+        self.prod_table.setColumnCount(7)
+        self.prod_table.setHorizontalHeaderLabels(["Producto / Plugin", "Fabricante", "Formatos", "Historial / Tracking", "Standalone", "Versión", "Tamaño Total"])
         self.prod_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.prod_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.prod_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.prod_table.setAlternatingRowColors(True)
         layout.addWidget(self.prod_table)
@@ -1105,6 +1158,11 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         # Bottom Actions Bar
         bottom_bar = QtWidgets.QHBoxLayout()
         self.lbl_prod_count = QtWidgets.QLabel("0 plugins detectados.")
+
+        self.btn_install_pack = QtWidgets.QPushButton("📦 Instalar Pack (.vstpack)")
+        self.btn_install_pack.setToolTip("Seleccionar e instalar uno o varios paquetes .vstpack en el entorno actual.")
+        self.btn_install_pack.setIcon(get_system_icon("archive-extract", "📦"))
+        self.btn_install_pack.clicked.connect(self.install_pack_action)
 
         self.btn_start_capture = QtWidgets.QPushButton("🔴 Capturar Cambios Manuales (Cracks/Licencias)")
         self.btn_start_capture.setToolTip("Inicia el rastreo para capturar licencias o parches manuales aplicados después de la instalación.")
@@ -1124,6 +1182,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         bottom_bar.addWidget(self.lbl_prod_count)
         bottom_bar.addSpacing(10)
+        bottom_bar.addWidget(self.btn_install_pack)
         bottom_bar.addWidget(self.btn_start_capture)
         bottom_bar.addWidget(self.btn_stop_capture)
         bottom_bar.addStretch()
@@ -1475,6 +1534,17 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             fmt_item = QtWidgets.QTableWidgetItem(fmt_str)
             fmt_item.setFont(QtGui.QFont(self.font().family(), 9, QtGui.QFont.Weight.Bold))
 
+            tracked = is_product_tracked(p, self.wine_prefix)
+            if tracked:
+                track_item = QtWidgets.QTableWidgetItem("✓ Rastreado (Listo)")
+                track_item.setForeground(QtGui.QColor("#16a34a"))
+                track_item.setFont(QtGui.QFont(self.font().family(), 9, QtGui.QFont.Weight.Bold))
+                track_item.setToolTip("Instalación registrada por Instrumentarium. Dispone de claves de Windows y datos para .vstpack.")
+            else:
+                track_item = QtWidgets.QTableWidgetItem("⚠️ No Rastreado")
+                track_item.setForeground(QtGui.QColor("#eab308"))
+                track_item.setToolTip("Plugin detectado sin historial de instalación. Para exportar a .vstpack, realiza una 'Captura Manual'.")
+
             if p["standalone"]:
                 standalone_widget = QtWidgets.QWidget()
                 s_layout = QtWidgets.QHBoxLayout(standalone_widget)
@@ -1483,9 +1553,9 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 btn_launch.setIcon(get_system_icon("media-playback-start", "▶"))
                 btn_launch.clicked.connect(lambda _, exe=p["standalone"]: self.launch_standalone(exe))
                 s_layout.addWidget(btn_launch)
-                self.prod_table.setCellWidget(row, 3, standalone_widget)
+                self.prod_table.setCellWidget(row, 4, standalone_widget)
             else:
-                self.prod_table.setItem(row, 3, QtWidgets.QTableWidgetItem("-"))
+                self.prod_table.setItem(row, 4, QtWidgets.QTableWidgetItem("-"))
 
             ver_item = QtWidgets.QTableWidgetItem(p["version"])
             size_item = QtWidgets.QTableWidgetItem(human_readable_size(p["size"]))
@@ -1493,8 +1563,9 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             self.prod_table.setItem(row, 0, name_item)
             self.prod_table.setItem(row, 1, vendor_item)
             self.prod_table.setItem(row, 2, fmt_item)
-            self.prod_table.setItem(row, 4, ver_item)
-            self.prod_table.setItem(row, 5, size_item)
+            self.prod_table.setItem(row, 3, track_item)
+            self.prod_table.setItem(row, 5, ver_item)
+            self.prod_table.setItem(row, 6, size_item)
 
         self.lbl_prod_count.setText(f"{len(product_list)} productos ({sum(len(p['files']) for p in product_list)} formatos/archivos) detectados.")
 
@@ -1570,39 +1641,131 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
     # ----------------------------------------------------
     # STACK EXPORT & MIGRATION (.vstpack)
     # ----------------------------------------------------
+    def install_pack_action(self):
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self,
+            "Seleccionar Paquetes de Plugins (.vstpack)",
+            os.path.expanduser("~"),
+            "Paquetes Instrumentarium (*.vstpack *.zip);;Todos los archivos (*)"
+        )
+        if files:
+            self.tabs.setCurrentIndex(1)
+            self.add_files(files)
+
+    # ----------------------------------------------------
+    # STACK EXPORT & MIGRATION (.vstpack)
+    # ----------------------------------------------------
     def export_selected_product(self):
         row = self.prod_table.currentRow()
         if row < 0 or row >= len(self.installed_products):
             QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un producto de la lista para exportar.")
             return
         p = self.installed_products[row]
-        self._prompt_and_export([p], f"{p['name']}_stack.vstpack")
 
-    def export_all_products(self):
-        if not self.installed_products:
-            QtWidgets.QMessageBox.information(self, "Sin plugins", "No hay plugins detectados para exportar.")
+        if not is_product_tracked(p, self.wine_prefix):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Plugin No Rastreado",
+                f"El plugin '<b>{p['name']}</b>' no fue instalado ni registrado a través de Instrumentarium.<br><br>"
+                "Al no disponer del historial de instalación original (claves del Registro de Windows, licencias y archivos en AppData), "
+                "<b>no se permite su exportación a <code>.vstpack</code></b> para evitar respaldos incompletos o defectuosos.<br><br>"
+                "<b>¿Cómo habilitar su exportación?</b><br>"
+                "• Pulsa el botón <b>'🔴 Capturar Cambios Manuales'</b> para registrar sus datos y licencias activas.<br>"
+                "• O reinstala el plugin utilizando Instrumentarium."
+            )
             return
-        stamp = time.strftime("%Y%m%d", time.localtime())
-        self._prompt_and_export(self.installed_products, f"ableton_vst_ecosystem_{stamp}.vstpack")
 
-    def _prompt_and_export(self, products_to_export, default_filename):
+        clean_name = re.sub(r'[/\:*?"<>|]', '_', p['name']).strip()
         dest, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Guardar Paquete de Migración VST",
-            os.path.join(os.path.expanduser("~"), default_filename),
-            "Ableton VST Package (*.vstpack *.zip *.tar.zst)"
+            f"Exportar Paquete Individual: {p['name']}",
+            os.path.join(os.path.expanduser("~"), f"{clean_name}.vstpack"),
+            "Paquete VSTPack (*.vstpack *.zip)"
         )
         if not dest:
             return
 
-        self.export_status_lbl.setText("Generando paquete de migración multiplataforma...")
-        
+        self._start_export_worker(dest, [p], mode="monolithic")
+
+    def export_all_products(self):
+        if not self.installed_products:
+            QtWidgets.QMessageBox.information(self, "Sin plugins", "No hay plugins detectados en este prefijo.")
+            return
+
+        tracked_products = [p for p in self.installed_products if is_product_tracked(p, self.wine_prefix)]
+        untracked_count = len(self.installed_products) - len(tracked_products)
+
+        if not tracked_products:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Sin Plugins Rastreados",
+                "Ninguno de los plugins detectados fue instalado ni registrado con Instrumentarium.<br><br>"
+                "Para poder exportar respaldos completos con registro y licencias, instala tus plugins mediante Instrumentarium "
+                "o utiliza el botón <b>'🔴 Capturar Cambios Manuales'</b> en la pestaña principal."
+            )
+            return
+
+        # Prompt user: Folder with Individual Packs (Default/Recommended) vs Monolithic File
+        msg_box = QtWidgets.QMessageBox(self)
+        msg_box.setWindowTitle("Modo de Respaldo - Instrumentarium")
+
+        warn_text = ""
+        if untracked_count > 0:
+            warn_text = f"<br><br><small style='color: #f59e0b;'>⚠️ Nota: Se detectaron {untracked_count} plugin(s) sin historial que serán omitidos por seguridad.</small>"
+
+        msg_box.setText(
+            f"<h3>Elige el formato de la Copia de Seguridad</h3>"
+            f"Se exportarán <b>{len(tracked_products)} plugin(s) rastreados</b>.{warn_text}<br><br>"
+            "<b>1. Carpeta con Paquetes Individuales (Por Defecto / Recomendado):</b><br>"
+            "Crea una carpeta fechada que contiene un archivo <code>.vstpack</code> independiente para cada plugin.<br><br>"
+            "<b>2. Archivo Monolítico Único:</b><br>"
+            "Empaqueta todo el stack completo en un único archivo consolidado."
+        )
+
+        btn_folder = msg_box.addButton("Carpeta con Packs Individuales (Recomendado)", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_single = msg_box.addButton("Archivo Único Consolidado", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        btn_cancel = msg_box.addButton("Cancelar", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        msg_box.setDefaultButton(btn_folder)
+
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+
+        if clicked == btn_cancel or clicked is None:
+            return
+
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+
+        if clicked == btn_folder:
+            base_dir = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                "Seleccionar Carpeta para Guardar el Respaldo",
+                os.path.expanduser("~")
+            )
+            if not base_dir:
+                return
+            target_folder = os.path.join(base_dir, f"Instrumentarium_Backup_{stamp}")
+            os.makedirs(target_folder, exist_ok=True)
+            self._start_export_worker(target_folder, tracked_products, mode="individual_folder")
+        else:
+            dest, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Guardar Archivo de Respaldo Completo",
+                os.path.join(os.path.expanduser("~"), f"Instrumentarium_Full_Backup_{stamp}.vstpack"),
+                "Paquete VSTPack (*.vstpack *.zip)"
+            )
+            if not dest:
+                return
+            self._start_export_worker(dest, tracked_products, mode="monolithic")
+
+    def _start_export_worker(self, target_path, products_to_export, mode="monolithic"):
+        self.export_status_lbl.setText("Generando paquete de migración...")
+
         # Prevent concurrent exports
         for btn in self.tab_dashboard.findChildren(QtWidgets.QPushButton) + self.tab_backup.findChildren(QtWidgets.QPushButton):
             if "Exportar" in btn.text():
                 btn.setEnabled(False)
 
-        self.export_worker = ExportWorker(dest, products_to_export, self.wine_prefix, self.wine_root)
+        self.export_worker = ExportWorker(target_path, products_to_export, self.wine_prefix, self.wine_root, mode=mode, is_windows=self.is_windows)
         self.export_worker.progress.connect(lambda msg: self.export_status_lbl.setText(msg))
         self.export_worker.finished.connect(self.on_export_finished)
         self.export_worker.start()
@@ -1613,15 +1776,15 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 btn.setEnabled(True)
 
         if success:
-            self.export_status_lbl.setText(f"✓ Paquete exportado exitosamente en: {result}")
+            self.export_status_lbl.setText(f"✓ Respaldo exportado exitosamente en: {result}")
             QtWidgets.QMessageBox.information(
                 self,
                 "Exportación Exitosa",
-                f"El paquete multiplataforma ha sido creado con éxito:\n\n{result}\n\n"
+                f"El respaldo ha sido generado con éxito:\n\n{result}\n\n"
                 "Características de compatibilidad:\n"
-                " • En Linux: Arrastra el archivo a esta aplicación o ejecuta install_linux.sh.\n"
-                " • En Windows: Descomprime el archivo y haz doble clic en 'install_windows.bat'.\n\n"
-                "Incluye binarios VST2/VST3/CLAP, presets, datos de AppData y claves de registro de Windows."
+                " • En Linux: Arrastra los paquetes .vstpack a Instrumentarium o ejecuta install_linux.sh.\n"
+                " • En Windows: Descomprime los paquetes y ejecuta install_windows.bat.\n\n"
+                "Todos los paquetes incluyen binarios VST2/VST3/CLAP, presets, datos de AppData y claves de registro de Windows."
             )
         else:
             self.export_status_lbl.setText(f"Error al exportar: {result}")
