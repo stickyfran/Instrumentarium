@@ -82,6 +82,15 @@ def human_readable_size(size_bytes: int) -> str:
 def get_system_icon(name: str, fallback_emoji: str = "") -> QtGui.QIcon:
     if QtGui.QIcon.hasThemeIcon(name):
         return QtGui.QIcon.fromTheme(name)
+    # Check local asset directory
+    for path in [
+        os.path.join(os.path.dirname(__file__), "assets", f"{name}.svg"),
+        os.path.join(os.path.dirname(__file__), "assets", f"{name}.png"),
+        os.path.expanduser(f"~/.local/share/icons/hicolor/scalable/apps/{name}.svg"),
+        os.path.expanduser(f"~/.local/share/icons/hicolor/256x256/apps/{name}.png"),
+    ]:
+        if os.path.isfile(path):
+            return QtGui.QIcon(path)
     return QtGui.QIcon()
 
 
@@ -932,7 +941,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Instrumentarium - Gestor de Plugins VST")
-        self.setWindowIcon(get_system_icon("system-software-install", "🎛️"))
+        self.setWindowIcon(get_system_icon("instrumentarium", "🎛️"))
         self.resize(980, 720)
         self.setMinimumSize(820, 560)
 

@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e1e28"/>
+      <stop offset="100%" stop-color="#0f0f14"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="knobGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#3b3b4f"/>
+      <stop offset="100%" stop-color="#232330"/>
+    </linearGradient>
+    <filter id="dropShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000000" flood-opacity="0.6"/>
+    </filter>
+  </defs>
+
+  <!-- Background Base Panel -->
+  <rect x="16" y="16" width="224" height="224" rx="44" fill="url(#bgGrad)" filter="url(#dropShadow)" stroke="#333344" stroke-width="2"/>
+  
+  <!-- Outer Accent Glow Rim -->
+  <rect x="22" y="22" width="212" height="212" rx="38" fill="none" stroke="url(#accentGrad)" stroke-width="1.5" stroke-opacity="0.4"/>
+
+  <!-- Top Display Screen -->
+  <rect x="40" y="42" width="176" height="64" rx="14" fill="#12121a" stroke="#252536" stroke-width="1.5"/>
+
+  <!-- Equalizer / Waveform Graph in Display -->
+  <path d="M 52 74 Q 68 52 84 74 T 116 74 T 148 74 T 180 74 T 204 74" fill="none" stroke="#22d3ee" stroke-width="2.5" stroke-linecap="round"/>
+  
+  <!-- Equalizer Peak Dots -->
+  <circle cx="84" cy="60" r="2.5" fill="#38bdf8"/>
+  <circle cx="116" cy="80" r="2.5" fill="#818cf8"/>
+  <circle cx="148" cy="56" r="2.5" fill="#a855f7"/>
+  <circle cx="180" cy="74" r="2.5" fill="#c084fc"/>
+
+  <!-- Slider Rails Bottom Left -->
+  <!-- Track 1 -->
+  <rect x="52" y="126" width="8" height="84" rx="4" fill="#1b1b26" stroke="#28283a" stroke-width="1"/>
+  <rect x="52" y="160" width="8" height="50" rx="4" fill="url(#accentGrad)" opacity="0.85"/>
+  <!-- Handle 1 -->
+  <rect x="46" y="152" width="20" height="12" rx="3" fill="#e2e8f0" filter="url(#dropShadow)"/>
+  <line x1="49" y1="158" x2="63" y2="158" stroke="#64748b" stroke-width="1.5"/>
+
+  <!-- Track 2 -->
+  <rect x="80" y="126" width="8" height="84" rx="4" fill="#1b1b26" stroke="#28283a" stroke-width="1"/>
+  <rect x="80" y="142" width="8" height="68" rx="4" fill="url(#accentGrad)" opacity="0.85"/>
+  <!-- Handle 2 -->
+  <rect x="74" y="136" width="20" height="12" rx="3" fill="#e2e8f0" filter="url(#dropShadow)"/>
+  <line x1="77" y1="142" x2="91" y2="142" stroke="#64748b" stroke-width="1.5"/>
+
+  <!-- Rotary Knob Bottom Right -->
+  <circle cx="164" cy="168" r="38" fill="url(#knobGrad)" stroke="#3e3e56" stroke-width="2"/>
+  
+  <!-- Outer Knob Indicator Ring -->
+  <circle cx="164" cy="168" r="44" fill="none" stroke="#262638" stroke-width="3"/>
+  <path d="M 134 198 A 44 44 0 1 1 194 198" fill="none" stroke="url(#accentGrad)" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Knob Notch / Pointer -->
+  <line x1="164" y1="168" x2="182" y2="146" stroke="#38bdf8" stroke-width="3.5" stroke-linecap="round"/>
+  <circle cx="164" cy="168" r="10" fill="#161622" stroke="#2c2c3e" stroke-width="1.5"/>
+</svg>
