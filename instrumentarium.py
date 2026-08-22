@@ -448,14 +448,22 @@ class InstallWorker(QtCore.QThread):
                     self.log_message.emit(f"Restaurando paquete de migración .vstpack...")
                     base_dir = os.path.dirname(file_path)
                     drive_src = os.path.join(base_dir, "drive_c")
+                    # Detect target wine user dynamically in the destination prefix
+                    target_wine_user = os.environ.get("USER", "kes")
+                    users_dir = os.path.join(self.get_drive_c(), "users")
+                    if os.path.isdir(users_dir):
+                        for u in os.listdir(users_dir):
+                            if u.lower() not in ["public", "default", "all users"] and os.path.isdir(os.path.join(users_dir, u)):
+                                target_wine_user = u
+                                break
+
                     if os.path.isdir(drive_src):
                         for root, _, files in os.walk(drive_src):
                             rel = os.path.relpath(root, drive_src)
                             # Match target user folder dynamically
                             rel_parts = rel.split(os.sep)
                             if len(rel_parts) >= 2 and rel_parts[0].lower() == "users":
-                                # Replace source username with current username
-                                rel_parts[1] = os.environ.get("USER", "kes")
+                                rel_parts[1] = target_wine_user
                                 rel = os.path.join(*rel_parts)
 
                             dest_folder = os.path.join(self.get_drive_c(), rel)
@@ -868,8 +876,26 @@ mkdir -p "$PREFIX/drive_c"
 
 if [ -d "$here/drive_c" ]; then
     echo "[1/2] Copiando archivos del stack a $PREFIX/drive_c/..."
-    cp -ru "$here/drive_c/." "$PREFIX/drive_c/"
-    echo "  [OK] Archivos restaurados."
+    
+    # 1. Copiar carpetas del sistema (Program Files, ProgramData, etc.)
+    for item in "$here/drive_c"/*; do
+        b="$(basename "$item")"
+        if [ "$b" != "users" ]; then
+            cp -ru "$item" "$PREFIX/drive_c/"
+        fi
+    done
+
+    # 2. Mapear datos de usuario (AppData, Documents) al usuario activo del prefijo destino
+    TARGET_USER="$(ls "$PREFIX/drive_c/users" 2>/dev/null | grep -viE 'public|default|all users' | head -n 1 || echo "${USER:-kes}")"
+    if [ -d "$here/drive_c/users" ]; then
+        for udir in "$here/drive_c/users"/*; do
+            if [ -d "$udir" ]; then
+                mkdir -p "$PREFIX/drive_c/users/$TARGET_USER"
+                cp -ru "$udir/." "$PREFIX/drive_c/users/$TARGET_USER/"
+            fi
+        done
+    fi
+    echo "  [OK] Archivos y datos de usuario restaurados."
 fi
 
 if [ -f "$here/registry.reg" ]; then
