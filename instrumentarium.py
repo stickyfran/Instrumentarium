@@ -371,9 +371,9 @@ class InstallWorker(QtCore.QThread):
         self._is_cancelled = True
 
     def run(self):
-        vst3_dest = os.path.join(self.wine_prefix, "drive_c", "Program Files", "Common Files", "VST3")
-        vst2_dest = os.path.join(self.wine_prefix, "drive_c", "Program Files", "VSTPlugins")
-        clap_dest = os.path.join(self.wine_prefix, "drive_c", "Program Files", "Common Files", "CLAP")
+        vst3_dest = os.path.join(self.get_drive_c(), "Program Files", "Common Files", "VST3")
+        vst2_dest = os.path.join(self.get_drive_c(), "Program Files", "VSTPlugins")
+        clap_dest = os.path.join(self.get_drive_c(), "Program Files", "Common Files", "CLAP")
         os.makedirs(vst3_dest, exist_ok=True)
         os.makedirs(vst2_dest, exist_ok=True)
         os.makedirs(clap_dest, exist_ok=True)
@@ -417,7 +417,7 @@ class InstallWorker(QtCore.QThread):
                                 rel_parts[1] = os.environ.get("USER", "kes")
                                 rel = os.path.join(*rel_parts)
 
-                            dest_folder = os.path.join(self.wine_prefix, "drive_c", rel)
+                            dest_folder = os.path.join(self.get_drive_c(), rel)
                             os.makedirs(dest_folder, exist_ok=True)
                             for f in files:
                                 s = os.path.join(root, f)
@@ -451,7 +451,7 @@ class InstallWorker(QtCore.QThread):
                                 if len(rel_parts) >= 2 and rel_parts[0].lower() == "users":
                                     rel_parts[1] = os.environ.get("USER", "kes")
                                     rel_f = os.path.join(*rel_parts)
-                                abs_files.append(os.path.join(self.wine_prefix, "drive_c", rel_f))
+                                abs_files.append(os.path.join(self.get_drive_c(), rel_f))
                                 
                             receipt_data = {
                                 "installer": "VSTPack Restore",
@@ -543,14 +543,17 @@ class InstallWorker(QtCore.QThread):
                             silent_args = ["/S", "/q"]
 
                         self.log_message.emit(f"Firma detectada: {installer_type.upper()}. Flags: {' '.join(silent_args)}")
-                        proc = subprocess.run([wine_bin, file_path] + silent_args, env=env, cwd=os.path.dirname(file_path))
+                        cmd_silent = [file_path] + silent_args if self.is_windows else [wine_bin, file_path] + silent_args
+                        proc = subprocess.run(cmd_silent, env=env, cwd=os.path.dirname(file_path))
                         
                         if proc.returncode != 0:
                             self.log_message.emit(f"Instalación silenciosa con fallos (código {proc.returncode}). Ejecutando modo interactivo de respaldo...")
-                            proc = subprocess.run(args, env=env, cwd=os.path.dirname(file_path))
+                            cmd_inter = [file_path] if self.is_windows else args
+                            proc = subprocess.run(cmd_inter, env=env, cwd=os.path.dirname(file_path))
                     else:
                         self.log_message.emit(f"Lanzando instalador: {file_path}")
-                        proc = subprocess.run(args, env=env, cwd=os.path.dirname(file_path))
+                        cmd_inter = [file_path] if self.is_windows else args
+                        proc = subprocess.run(cmd_inter, env=env, cwd=os.path.dirname(file_path))
 
                     # Compute Diff & Save Tracked Receipt
                     diff = compute_snapshot_diff(snap_before, self.wine_prefix, self.wine_root)
@@ -662,7 +665,7 @@ class ExportWorker(QtCore.QThread):
 
                 for fpath in p["files"]:
                     if os.path.exists(fpath):
-                        rel = os.path.relpath(fpath, os.path.join(self.wine_prefix, "drive_c"))
+                        rel = os.path.relpath(fpath, self.get_drive_c())
                         # Skip if it's outside drive_c (e.g. symlinks leading outside)
                         if rel.startswith(".."):
                             continue
@@ -684,7 +687,7 @@ class ExportWorker(QtCore.QThread):
                         os.path.join("users", os.environ.get("USER", "kes"), "Documents", p["vendor"]),
                         os.path.join("ProgramData", p["vendor"]),
                     ]:
-                        src_sub = os.path.join(self.wine_prefix, "drive_c", sub)
+                        src_sub = os.path.join(self.get_drive_c(), sub)
                         if os.path.exists(src_sub):
                             dest_sub = os.path.join(drive_dest, sub)
                             os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
@@ -1015,6 +1018,39 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         layout.setContentsMargins(6, 10, 6, 6)
         layout.setSpacing(8)
 
+        # Prefix Chooser
+        prefix_bar = QtWidgets.QHBoxLayout()
+        prefix_lbl = QtWidgets.QLabel("Prefix/Entorno:")
+        self.cmb_prefix = QtWidgets.QComboBox()
+        self.cmb_prefix.setEditable(True)
+        self.cmb_prefix.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        
+        if self.is_windows:
+            self.cmb_prefix.addItem(self.wine_prefix)
+            self.cmb_prefix.setEnabled(False)
+        else:
+            self.cmb_prefix.addItem(self.wine_prefix)
+            try:
+                home = os.path.expanduser("~")
+                for d in os.listdir(home):
+                    p = os.path.join(home, d)
+                    if os.path.isdir(p) and d.startswith(".wine") and p != self.wine_prefix:
+                        self.cmb_prefix.addItem(p)
+            except:
+                pass
+            
+        self.btn_browse_prefix = QtWidgets.QPushButton("Examinar...")
+        self.btn_browse_prefix.clicked.connect(self.browse_prefix_action)
+        if self.is_windows:
+            self.btn_browse_prefix.setEnabled(False)
+            
+        self.cmb_prefix.currentTextChanged.connect(self.change_prefix_action)
+            
+        prefix_bar.addWidget(prefix_lbl)
+        prefix_bar.addWidget(self.cmb_prefix)
+        prefix_bar.addWidget(self.btn_browse_prefix)
+        layout.addLayout(prefix_bar)
+
         # Filter & Top Controls
         top_bar = QtWidgets.QHBoxLayout()
         self.txt_filter = QtWidgets.QLineEdit()
@@ -1025,11 +1061,11 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         btn_open_vst3 = QtWidgets.QPushButton("Carpeta VST3")
         btn_open_vst3.setIcon(get_system_icon("folder-open", "📂"))
-        btn_open_vst3.clicked.connect(lambda: self.open_folder_in_fm(os.path.join(self.wine_prefix, "drive_c", "Program Files", "Common Files", "VST3")))
+        btn_open_vst3.clicked.connect(lambda: self.open_folder_in_fm(os.path.join(self.get_drive_c(), "Program Files", "Common Files", "VST3")))
         
         btn_open_vst2 = QtWidgets.QPushButton("Carpeta VST2")
         btn_open_vst2.setIcon(get_system_icon("folder-open", "📂"))
-        btn_open_vst2.clicked.connect(lambda: self.open_folder_in_fm(os.path.join(self.wine_prefix, "drive_c", "Program Files", "VSTPlugins")))
+        btn_open_vst2.clicked.connect(lambda: self.open_folder_in_fm(os.path.join(self.get_drive_c(), "Program Files", "VSTPlugins")))
         
         btn_refresh = QtWidgets.QPushButton("Actualizar")
         btn_refresh.setIcon(get_system_icon("view-refresh", "🔄"))
@@ -1308,13 +1344,31 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             
         self.refresh_installed_ecosystem()
 
+    def browse_prefix_action(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(self, "Seleccionar Carpeta del Prefix de Wine", os.path.expanduser("~"))
+        if d:
+            if self.cmb_prefix.findText(d) == -1:
+                self.cmb_prefix.addItem(d)
+            self.cmb_prefix.setCurrentText(d)
+
+    def change_prefix_action(self, text):
+        if text and os.path.isdir(text):
+            self.wine_prefix = text
+            os.environ["WINEPREFIX"] = text
+            self.refresh_installed_ecosystem()
+            
+
+    def get_drive_c(self):
+        if hasattr(self, "is_windows") and self.is_windows:
+            return os.environ.get("SystemDrive", "C:") + "\\"
+        return self.get_drive_c()
     def refresh_installed_ecosystem(self):
-        vst3_dir = os.path.join(self.wine_prefix, "drive_c", "Program Files", "Common Files", "VST3")
-        vst2_dir = os.path.join(self.wine_prefix, "drive_c", "Program Files", "VSTPlugins")
-        clap_dir = os.path.join(self.wine_prefix, "drive_c", "Program Files", "Common Files", "CLAP")
+        vst3_dir = os.path.join(self.get_drive_c(), "Program Files", "Common Files", "VST3")
+        vst2_dir = os.path.join(self.get_drive_c(), "Program Files", "VSTPlugins")
+        clap_dir = os.path.join(self.get_drive_c(), "Program Files", "Common Files", "CLAP")
 
         standalone_map = {}
-        prog_files = os.path.join(self.wine_prefix, "drive_c", "Program Files")
+        prog_files = os.path.join(self.get_drive_c(), "Program Files")
         
         if os.path.exists(prog_files):
             for root, _, files in os.walk(prog_files):
