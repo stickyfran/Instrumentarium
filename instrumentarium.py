@@ -400,13 +400,17 @@ class InstallWorker(QtCore.QThread):
     log_message = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, items, wine_prefix, wine_root, silent_mode=False):
+    def __init__(self, items, wine_prefix, wine_root, silent_mode=False, is_windows=False):
         super().__init__()
         self.items = items
         self.wine_prefix = wine_prefix
         self.wine_root = wine_root
         self.silent_mode = silent_mode
+        self.is_windows = is_windows
         self._is_cancelled = False
+
+    def get_drive_c(self):
+        return get_drive_c_path(self.wine_prefix, getattr(self, "is_windows", False))
 
     def cancel(self):
         self._is_cancelled = True
@@ -1980,7 +1984,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.progress_bar.setValue(0)
 
         silent = self.chk_silent.isChecked()
-        self.worker = InstallWorker(self.queue_items, self.wine_prefix, self.wine_root, silent_mode=silent)
+        self.worker = InstallWorker(self.queue_items, self.wine_prefix, self.wine_root, silent_mode=silent, is_windows=getattr(self, 'is_windows', False))
         self.worker.progress.connect(self.on_progress)
         self.worker.item_status.connect(self.on_item_status)
         self.worker.log_message.connect(lambda msg: self.log_text.appendPlainText(msg))
