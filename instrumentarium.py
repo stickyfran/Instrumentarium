@@ -260,7 +260,7 @@ def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
             pass
 
     files = {}
-    drive_c = os.path.join(prefix, "drive_c")
+    drive_c = get_drive_c_path(prefix)
     if os.path.isdir(drive_c):
         for root, _, filenames in os.walk(drive_c):
             for f in filenames:
@@ -295,7 +295,7 @@ def compute_snapshot_diff(before: dict, prefix: str, wine_root: str = "") -> dic
             pass
 
     new_files = []
-    drive_c = os.path.join(prefix, "drive_c")
+    drive_c = get_drive_c_path(prefix)
     before_files = before.get("files", {})
 
     if os.path.isdir(drive_c):
@@ -1619,11 +1619,14 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.render_products_table(filtered)
 
     def launch_standalone(self, exe_path):
-        wine_bin = os.path.join(self.wine_root, "bin", "wine")
-        env = os.environ.copy()
-        env["WINEPREFIX"] = self.wine_prefix
-        env["WINEDEBUG"] = "-all"
-        subprocess.Popen([wine_bin, exe_path], env=env, cwd=os.path.dirname(exe_path))
+        if getattr(self, "is_windows", False):
+            subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
+        else:
+            wine_bin = os.path.join(self.wine_root, "bin", "wine")
+            env = os.environ.copy()
+            env["WINEPREFIX"] = self.wine_prefix
+            env["WINEDEBUG"] = "-all"
+            subprocess.Popen([wine_bin, exe_path], env=env, cwd=os.path.dirname(exe_path))
 
     def delete_selected_product(self):
         row = self.prod_table.currentRow()
@@ -1643,6 +1646,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             files_to_delete = set(p["files"])
             tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
             receipts_to_delete = []
+            p_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', p["name"]).lower()
             if os.path.isdir(tracker_dir):
                 import json
                 for rf in os.listdir(tracker_dir):
@@ -1652,7 +1656,8 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                             with open(rpath, "r", encoding="utf-8") as rf_fd:
                                 rdata = json.load(rf_fd)
                                 r_files = rdata.get("new_files", [])
-                                if any(f_ in files_to_delete for f_ in r_files):
+                                match = any(f_ in files_to_delete for f_ in r_files) or (p_name_clean and rf.lower().startswith(p_name_clean))
+                                if match:
                                     files_to_delete.update(r_files)
                                     receipts_to_delete.append(rpath)
                         except Exception:
