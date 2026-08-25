@@ -75,6 +75,27 @@ def get_drive_c_path(wine_prefix: str, is_windows: bool = False) -> str:
     return os.path.join(wine_prefix, "drive_c")
 
 
+def get_wine_users(drive_c: str) -> list:
+    users = []
+    users_dir = os.path.join(drive_c, "users")
+    if os.path.isdir(users_dir):
+        for u in os.listdir(users_dir):
+            if u.lower() not in ["public", "default", "default user", "all users"] and os.path.isdir(os.path.join(users_dir, u)):
+                users.append(u)
+    if not users:
+        users = [os.environ.get("USER", os.environ.get("USERNAME", "user"))]
+    return users
+
+
+def get_primary_wine_user(drive_c: str) -> str:
+    users = get_wine_users(drive_c)
+    host_user = os.environ.get("USER", os.environ.get("USERNAME", ""))
+    for u in users:
+        if u.lower() == host_user.lower():
+            return u
+    return users[0] if users else "user"
+
+
 def is_product_tracked(product: dict, wine_prefix: str) -> bool:
     tracker_dir = os.path.join(wine_prefix, ".vst_tracker")
     if not os.path.isdir(tracker_dir):
@@ -86,8 +107,9 @@ def is_product_tracked(product: dict, wine_prefix: str) -> bool:
     try:
         for rf in os.listdir(tracker_dir):
             if rf.endswith(".json"):
-                rf_clean = rf.lower()
-                if p_name_clean and (rf_clean.startswith(p_name_clean) or p_name_clean in rf_clean):
+                rf_stem = os.path.splitext(rf)[0].lower()
+                name_match = (rf_stem == p_name_clean or rf_stem.startswith(f"{p_name_clean}_"))
+                if p_name_clean and name_match:
                     return True
                 try:
                     with open(os.path.join(tracker_dir, rf), "r", encoding="utf-8") as f_rf:
@@ -95,11 +117,19 @@ def is_product_tracked(product: dict, wine_prefix: str) -> bool:
                         r_files = set(rdata.get("new_files", []))
                         if p_files_set.intersection(r_files):
                             return True
+                        for pf in p_files_set:
+                            pf_dir = pf if pf.endswith(os.sep) else pf + os.sep
+                            for f_ in r_files:
+                                f_dir = f_ if f_.endswith(os.sep) else f_ + os.sep
+                                if f_.startswith(pf_dir) or pf.startswith(f_dir):
+                                    return True
                 except Exception:
                     pass
     except Exception:
         pass
     return False
+
+
 def human_readable_size(size_bytes: int) -> str:
     if size_bytes < 1024:
         return f"{size_bytes} B"
@@ -248,16 +278,38 @@ def extract_archive(archive_path: str, target_dir: str) -> bool:
     return False
 
 
-def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
-    """Takes a snapshot of the prefix filesystem and registry state."""
+def should_ignore_snapshot_path(fp: str) -> bool:
+    """Filters out transient installer caches and tracker receipts from tracking diffs."""
+    norm = fp.replace("\\", "/").lower()
+    if "/.vst_tracker/" in norm or norm.endswith("/.vst_tracker") or ".vst_tracker" in norm.split("/"):
+        return True
+    if "/windows/temp/" in norm or "/appdata/local/temp/" in norm or "/users/temp/" in norm:
+        return True
+    if "/inetcache/" in norm or "/crashdumps/" in norm or "/cryptneturlcache/" in norm:
+        return True
+    if norm.endswith(".tmp") or norm.endswith(".log") or norm.endswith("wineserver.pid") or norm.endswith("wine_server_lock"):
+        return True
+    if "/throttle_store/" in norm or norm.endswith("throttle_store"):
+        return True
+    return False
+
+
+def sync_wineserver(wine_root: str, prefix: str, timeout: int = 10):
+    """Flushes wine registry state to disk and waits for background wine processes."""
     if wine_root and os.path.isfile(os.path.join(wine_root, "bin", "wineserver")):
         try:
             env = os.environ.copy()
             env["WINEPREFIX"] = prefix
-            subprocess.run([os.path.join(wine_root, "bin", "wineserver"), "-w"],
-                           env=env, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ws = os.path.join(wine_root, "bin", "wineserver")
+            subprocess.run([ws, "-w"], env=env, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.3)
         except Exception:
             pass
+
+
+def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
+    """Takes a snapshot of the prefix filesystem and registry state."""
+    sync_wineserver(wine_root, prefix, timeout=10)
 
     files = {}
     drive_c = get_drive_c_path(prefix)
@@ -265,6 +317,8 @@ def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
         for root, _, filenames in os.walk(drive_c):
             for f in filenames:
                 fp = os.path.join(root, f)
+                if should_ignore_snapshot_path(fp):
+                    continue
                 try:
                     files[fp] = os.path.getmtime(fp)
                 except Exception:
@@ -285,14 +339,7 @@ def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
 
 def compute_snapshot_diff(before: dict, prefix: str, wine_root: str = "") -> dict:
     """Computes exact new files and registry entries created during an installation."""
-    if wine_root and os.path.isfile(os.path.join(wine_root, "bin", "wineserver")):
-        try:
-            env = os.environ.copy()
-            env["WINEPREFIX"] = prefix
-            subprocess.run([os.path.join(wine_root, "bin", "wineserver"), "-w"],
-                           env=env, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+    sync_wineserver(wine_root, prefix, timeout=10)
 
     new_files = []
     drive_c = get_drive_c_path(prefix)
@@ -302,7 +349,7 @@ def compute_snapshot_diff(before: dict, prefix: str, wine_root: str = "") -> dic
         for root, _, filenames in os.walk(drive_c):
             for f in filenames:
                 fp = os.path.join(root, f)
-                if any(k in fp.lower() for k in ["/temp/", "/cache/", "throttle_store", ".log"]):
+                if should_ignore_snapshot_path(fp):
                     continue
                 if fp not in before_files:
                     new_files.append(fp)
@@ -453,13 +500,7 @@ class InstallWorker(QtCore.QThread):
                     base_dir = os.path.dirname(file_path)
                     drive_src = os.path.join(base_dir, "drive_c")
                     # Detect target wine user dynamically in the destination prefix
-                    target_wine_user = os.environ.get("USER", "kes")
-                    users_dir = os.path.join(self.get_drive_c(), "users")
-                    if os.path.isdir(users_dir):
-                        for u in os.listdir(users_dir):
-                            if u.lower() not in ["public", "default", "all users"] and os.path.isdir(os.path.join(users_dir, u)):
-                                target_wine_user = u
-                                break
+                    target_wine_user = get_primary_wine_user(self.get_drive_c())
 
                     if os.path.isdir(drive_src):
                         for root, _, files in os.walk(drive_src):
@@ -502,7 +543,7 @@ class InstallWorker(QtCore.QThread):
                                 rel_f = f
                                 rel_parts = rel_f.split(os.sep)
                                 if len(rel_parts) >= 2 and rel_parts[0].lower() == "users":
-                                    rel_parts[1] = os.environ.get("USER", "kes")
+                                    rel_parts[1] = target_wine_user
                                     rel_f = os.path.join(*rel_parts)
                                 abs_files.append(os.path.join(self.get_drive_c(), rel_f))
                                 
@@ -533,8 +574,33 @@ class InstallWorker(QtCore.QThread):
                         shutil.copytree(file_path, dest)
                     else:
                         shutil.copy2(file_path, dest)
+
+                    # Track installed VST3
+                    tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+                    os.makedirs(tracker_dir, exist_ok=True)
+                    stem = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(filename)[0])
+                    receipt_path = os.path.join(tracker_dir, f"{stem}_vst3_{int(time.time())}.json")
+                    tracked_files = []
+                    if os.path.isdir(dest):
+                        for root, _, flist in os.walk(dest):
+                            for f in flist:
+                                tracked_files.append(os.path.join(root, f))
+                        if not tracked_files:
+                            tracked_files.append(dest)
+                    else:
+                        tracked_files.append(dest)
+
+                    with open(receipt_path, "w", encoding="utf-8") as rpf:
+                        json.dump({
+                            "installer": filename,
+                            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "new_files": tracked_files,
+                            "reg_lines_count": 0,
+                            "reg_diff": []
+                        }, rpf, indent=2)
+
                     self.item_status.emit(row, "✓ VST3 Instalado", "#16a34a")
-                    self.log_message.emit(f"Copiado VST3 a: {dest}")
+                    self.log_message.emit(f"Copiado VST3 a: {dest} (Rastreado)")
 
                 # 2. VST2 DLL
                 elif file_path.lower().endswith(".dll"):
@@ -545,8 +611,23 @@ class InstallWorker(QtCore.QThread):
                         else:
                             os.remove(dest)
                     shutil.copy2(file_path, dest)
+
+                    # Track installed VST2 DLL
+                    tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+                    os.makedirs(tracker_dir, exist_ok=True)
+                    stem = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(filename)[0])
+                    receipt_path = os.path.join(tracker_dir, f"{stem}_vst2_{int(time.time())}.json")
+                    with open(receipt_path, "w", encoding="utf-8") as rpf:
+                        json.dump({
+                            "installer": filename,
+                            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "new_files": [dest],
+                            "reg_lines_count": 0,
+                            "reg_diff": []
+                        }, rpf, indent=2)
+
                     self.item_status.emit(row, "✓ VST2 Instalado", "#16a34a")
-                    self.log_message.emit(f"Copiado VST2 DLL a: {dest}")
+                    self.log_message.emit(f"Copiado VST2 DLL a: {dest} (Rastreado)")
 
                 # 3. CLAP Plugin
                 elif file_path.lower().endswith(".clap"):
@@ -560,8 +641,33 @@ class InstallWorker(QtCore.QThread):
                         shutil.copytree(file_path, dest)
                     else:
                         shutil.copy2(file_path, dest)
+
+                    # Track installed CLAP
+                    tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+                    os.makedirs(tracker_dir, exist_ok=True)
+                    stem = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(filename)[0])
+                    receipt_path = os.path.join(tracker_dir, f"{stem}_clap_{int(time.time())}.json")
+                    tracked_files = []
+                    if os.path.isdir(dest):
+                        for root, _, flist in os.walk(dest):
+                            for f in flist:
+                                tracked_files.append(os.path.join(root, f))
+                        if not tracked_files:
+                            tracked_files.append(dest)
+                    else:
+                        tracked_files.append(dest)
+
+                    with open(receipt_path, "w", encoding="utf-8") as rpf:
+                        json.dump({
+                            "installer": filename,
+                            "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                            "new_files": tracked_files,
+                            "reg_lines_count": 0,
+                            "reg_diff": []
+                        }, rpf, indent=2)
+
                     self.item_status.emit(row, "✓ CLAP Instalado", "#16a34a")
-                    self.log_message.emit(f"Copiado CLAP a: {dest}")
+                    self.log_message.emit(f"Copiado CLAP a: {dest} (Rastreado)")
 
                 # 4. Windows Executable Installer (.exe)
                 elif file_path.lower().endswith(".exe"):
@@ -614,7 +720,7 @@ class InstallWorker(QtCore.QThread):
                     os.makedirs(tracker_dir, exist_ok=True)
                     
                     stem = re.sub(r'[^a-zA-Z0-9_]', '_', os.path.splitext(filename)[0])
-                    receipt_path = os.path.join(tracker_dir, f"{stem}.json")
+                    receipt_path = os.path.join(tracker_dir, f"{stem}_exe_{int(time.time())}.json")
                     receipt_data = {
                         "installer": filename,
                         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -692,6 +798,17 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                 r_files = r.get("new_files", [])
                 r_installer = r.get("installer", "").lower()
                 match = any(f in p_files_set for f in r_files) or (p_name_clean and p_name_clean in r_installer)
+                if not match:
+                    for pf in p_files_set:
+                        pf_dir = pf if pf.endswith(os.sep) else pf + os.sep
+                        for rf in r_files:
+                            rf_dir = rf if rf.endswith(os.sep) else rf + os.sep
+                            if rf.startswith(pf_dir) or pf.startswith(rf_dir):
+                                match = True
+                                break
+                        if match:
+                            break
+
                 if match:
                     for f in r_files:
                         if f not in p["files"] and os.path.exists(f):
@@ -728,11 +845,32 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                         p_entry["files"].append(rel)
 
             if p["vendor"] and p["vendor"] != "Desconocido":
-                user_name = os.environ.get("USER", "kes")
+                wine_users = get_wine_users(drive_c_src)
+                for u_name in wine_users:
+                    for sub in [
+                        os.path.join("users", u_name, "AppData", "Roaming", p["vendor"]),
+                        os.path.join("users", u_name, "AppData", "Local", p["vendor"]),
+                        os.path.join("users", u_name, "Documents", p["vendor"]),
+                    ]:
+                        src_sub = os.path.join(drive_c_src, sub)
+                        if os.path.exists(src_sub):
+                            dest_sub = os.path.join(drive_dest, sub)
+                            os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
+                            if os.path.isdir(src_sub):
+                                if not os.path.exists(dest_sub):
+                                    shutil.copytree(src_sub, dest_sub)
+                                for root_s, _, fn_list in os.walk(dest_sub):
+                                    for fn in fn_list:
+                                        rel_f = os.path.relpath(os.path.join(root_s, fn), drive_dest)
+                                        if rel_f not in p_entry["files"]:
+                                            p_entry["files"].append(rel_f)
+                            else:
+                                shutil.copy2(src_sub, dest_sub)
+                                rel_f = os.path.relpath(dest_sub, drive_dest)
+                                if rel_f not in p_entry["files"]:
+                                    p_entry["files"].append(rel_f)
+
                 for sub in [
-                    os.path.join("users", user_name, "AppData", "Roaming", p["vendor"]),
-                    os.path.join("users", user_name, "AppData", "Local", p["vendor"]),
-                    os.path.join("users", user_name, "Documents", p["vendor"]),
                     os.path.join("users", "Public", "Documents", p["vendor"]),
                     os.path.join("ProgramData", p["vendor"]),
                 ]:
@@ -743,8 +881,16 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                         if os.path.isdir(src_sub):
                             if not os.path.exists(dest_sub):
                                 shutil.copytree(src_sub, dest_sub)
+                            for root_s, _, fn_list in os.walk(dest_sub):
+                                for fn in fn_list:
+                                    rel_f = os.path.relpath(os.path.join(root_s, fn), drive_dest)
+                                    if rel_f not in p_entry["files"]:
+                                        p_entry["files"].append(rel_f)
                         else:
                             shutil.copy2(src_sub, dest_sub)
+                            rel_f = os.path.relpath(dest_sub, drive_dest)
+                            if rel_f not in p_entry["files"]:
+                                p_entry["files"].append(rel_f)
 
             manifest["products"].append(p_entry)
 
@@ -839,7 +985,7 @@ if exist "drive_c\users\Public\Documents" (
     xcopy /E /I /Y "drive_c\users\Public\Documents\*" "%PUBLIC%\Documents\" >nul
 )
 for /D %%U in ("drive_c\users\*") do (
-    if /I not "%%~nxU"=="Public" if /I not "%%~nxU"=="Default" (
+    if /I not "%%~nxU"=="Public" if /I not "%%~nxU"=="Default" if /I not "%%~nxU"=="Default User" if /I not "%%~nxU"=="All Users" (
         if exist "%%U\AppData\Roaming" (
             xcopy /E /I /Y "%%U\AppData\Roaming\*" "%APPDATA%\" >nul
         )
@@ -897,12 +1043,18 @@ if [ -d "$here/drive_c" ]; then
     done
 
     # 2. Mapear datos de usuario (AppData, Documents) al usuario activo del prefijo destino
-    TARGET_USER="$(ls "$PREFIX/drive_c/users" 2>/dev/null | grep -viE 'public|default|all users' | head -n 1 || echo "${USER:-kes}")"
+    TARGET_USER="$(ls "$PREFIX/drive_c/users" 2>/dev/null | grep -viE '^(public|default|all users|default user)$' | head -n 1 || echo "${USER:-user}")"
     if [ -d "$here/drive_c/users" ]; then
         for udir in "$here/drive_c/users"/*; do
             if [ -d "$udir" ]; then
-                mkdir -p "$PREFIX/drive_c/users/$TARGET_USER"
-                cp -ru "$udir/." "$PREFIX/drive_c/users/$TARGET_USER/"
+                ubase="$(basename "$udir")"
+                if [ "$ubase" = "Public" ] || [ "$ubase" = "Default" ] || [ "$ubase" = "default user" ] || [ "$ubase" = "All Users" ]; then
+                    mkdir -p "$PREFIX/drive_c/users/$ubase"
+                    cp -ru "$udir/." "$PREFIX/drive_c/users/$ubase/"
+                else
+                    mkdir -p "$PREFIX/drive_c/users/$TARGET_USER"
+                    cp -ru "$udir/." "$PREFIX/drive_c/users/$TARGET_USER/"
+                fi
             fi
         done
     fi
@@ -1042,6 +1194,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.queue_items = []
         self.temp_dirs = []
         self.installed_products = []
+        self.manual_snapshot = None
         self.worker = None
         self.extractor_workers = []
         self.export_worker = None
@@ -1399,6 +1552,14 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.lbl_prod_count.setStyleSheet("color: #ef4444; font-weight: bold;")
 
     def stop_manual_capture(self):
+        if not hasattr(self, "manual_snapshot") or self.manual_snapshot is None:
+            self.btn_start_capture.setVisible(True)
+            self.btn_stop_capture.setVisible(False)
+            self.lbl_prod_count.setText("No hay captura en curso.")
+            self.lbl_prod_count.setStyleSheet("")
+            QtWidgets.QMessageBox.warning(self, "Sin Captura Activa", "No se encontró una captura iniciada. Presiona '🔴 Capturar Cambios Manuales' antes de finalizar.")
+            return
+
         self.lbl_prod_count.setText("Analizando diferencias... Por favor espera.")
         self.lbl_prod_count.setStyleSheet("")
         QtWidgets.QApplication.processEvents()
@@ -1562,6 +1723,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             self.prod_table.insertRow(row)
 
             name_item = QtWidgets.QTableWidgetItem(p["name"])
+            name_item.setData(QtCore.Qt.ItemDataRole.UserRole, p)
             name_item.setFont(QtGui.QFont(self.font().family(), 10, QtGui.QFont.Weight.Bold))
 
             vendor_item = QtWidgets.QTableWidgetItem(p["vendor"])
@@ -1618,6 +1780,22 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 filtered.append(p)
         self.render_products_table(filtered)
 
+    def _get_selected_product(self):
+        row = self.prod_table.currentRow()
+        if row < 0:
+            return None
+        item = self.prod_table.item(row, 0)
+        if not item:
+            return None
+        p = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(p, dict):
+            return p
+        name = item.text()
+        for prod in self.installed_products:
+            if prod.get("name") == name:
+                return prod
+        return None
+
     def launch_standalone(self, exe_path):
         if getattr(self, "is_windows", False):
             subprocess.Popen([exe_path], cwd=os.path.dirname(exe_path))
@@ -1629,12 +1807,11 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             subprocess.Popen([wine_bin, exe_path], env=env, cwd=os.path.dirname(exe_path))
 
     def delete_selected_product(self):
-        row = self.prod_table.currentRow()
-        if row < 0 or row >= len(self.installed_products):
+        p = self._get_selected_product()
+        if not p:
             QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un producto de la lista para eliminar.")
             return
 
-        p = self.installed_products[row]
         files_str = "\n".join([f" • {f}" for f in p["files"]])
         confirm = QtWidgets.QMessageBox.question(
             self,
@@ -1656,7 +1833,15 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                             with open(rpath, "r", encoding="utf-8") as rf_fd:
                                 rdata = json.load(rf_fd)
                                 r_files = rdata.get("new_files", [])
-                                match = any(f_ in files_to_delete for f_ in r_files) or (p_name_clean and rf.lower().startswith(p_name_clean))
+                                rf_stem = os.path.splitext(rf)[0].lower()
+                                name_match = (rf_stem == p_name_clean or rf_stem.startswith(f"{p_name_clean}_"))
+                                match = any(f_ in files_to_delete for f_ in r_files) or (p_name_clean and name_match)
+                                if not match:
+                                    for pf in files_to_delete:
+                                        pf_dir = pf if pf.endswith(os.sep) else pf + os.sep
+                                        if any(rf_.startswith(pf_dir) for rf_ in r_files):
+                                            match = True
+                                            break
                                 if match:
                                     files_to_delete.update(r_files)
                                     receipts_to_delete.append(rpath)
@@ -1698,11 +1883,10 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
     # STACK EXPORT & MIGRATION (.vstpack)
     # ----------------------------------------------------
     def export_selected_product(self):
-        row = self.prod_table.currentRow()
-        if row < 0 or row >= len(self.installed_products):
+        p = self._get_selected_product()
+        if not p:
             QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un producto de la lista para exportar.")
             return
-        p = self.installed_products[row]
 
         if not is_product_tracked(p, self.wine_prefix):
             QtWidgets.QMessageBox.warning(
