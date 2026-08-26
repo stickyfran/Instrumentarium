@@ -307,6 +307,33 @@ def sync_wineserver(wine_root: str, prefix: str, timeout: int = 10):
             pass
 
 
+def walk_prefix_files(drive_c: str):
+    """Walks all prefix files including symlinked user Document/Music directories, yielding normalized virtual paths under drive_c."""
+    if not os.path.isdir(drive_c):
+        return
+
+    # 1. Standard walk of drive_c
+    for root, _, filenames in os.walk(drive_c):
+        for f in filenames:
+            yield os.path.join(root, f)
+
+    # 2. Walk symlinked user folders (Documents, Music) to capture presets installed outside drive_c root
+    users = get_wine_users(drive_c)
+    for u in users:
+        for folder_name in ["Documents", "Music"]:
+            user_sub = os.path.join(drive_c, "users", u, folder_name)
+            if os.path.islink(user_sub) and os.path.isdir(user_sub):
+                real_target = os.path.realpath(user_sub)
+                for root, _, filenames in os.walk(real_target):
+                    rel_inside = os.path.relpath(root, real_target)
+                    for f in filenames:
+                        if rel_inside == ".":
+                            virtual_fp = os.path.join(user_sub, f)
+                        else:
+                            virtual_fp = os.path.join(user_sub, rel_inside, f)
+                        yield virtual_fp
+
+
 def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
     """Takes a snapshot of the prefix filesystem and registry state."""
     sync_wineserver(wine_root, prefix, timeout=10)
@@ -314,15 +341,13 @@ def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
     files = {}
     drive_c = get_drive_c_path(prefix)
     if os.path.isdir(drive_c):
-        for root, _, filenames in os.walk(drive_c):
-            for f in filenames:
-                fp = os.path.join(root, f)
-                if should_ignore_snapshot_path(fp):
-                    continue
-                try:
-                    files[fp] = os.path.getmtime(fp)
-                except Exception:
-                    pass
+        for fp in walk_prefix_files(drive_c):
+            if should_ignore_snapshot_path(fp):
+                continue
+            try:
+                files[fp] = os.path.getmtime(fp)
+            except Exception:
+                pass
 
     reg_state = {}
     for reg_name in ["system.reg", "user.reg"]:
@@ -346,19 +371,17 @@ def compute_snapshot_diff(before: dict, prefix: str, wine_root: str = "") -> dic
     before_files = before.get("files", {})
 
     if os.path.isdir(drive_c):
-        for root, _, filenames in os.walk(drive_c):
-            for f in filenames:
-                fp = os.path.join(root, f)
-                if should_ignore_snapshot_path(fp):
-                    continue
-                if fp not in before_files:
-                    new_files.append(fp)
-                else:
-                    try:
-                        if os.path.getmtime(fp) > before_files[fp]:
-                            new_files.append(fp)
-                    except Exception:
-                        pass
+        for fp in walk_prefix_files(drive_c):
+            if should_ignore_snapshot_path(fp):
+                continue
+            if fp not in before_files:
+                new_files.append(fp)
+            else:
+                try:
+                    if os.path.getmtime(fp) > before_files[fp]:
+                        new_files.append(fp)
+                except Exception:
+                    pass
 
     new_reg_lines = []
     before_reg = before.get("reg", {})
@@ -824,32 +847,70 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                                 else:
                                     keys_to_export.add(path)
 
-            if p["vendor"] and p["vendor"] != "Desconocido":
-                keys_to_export.add(f"Software\\{p['vendor']}")
+            candidate_folders = set()
+            if p.get("vendor") and p["vendor"] != "Desconocido":
+                candidate_folders.add(p["vendor"])
+            if p.get("name"):
+                candidate_folders.add(p["name"])
+                # Also add name without spaces or trailing numbers
+                clean_n = re.sub(r'[^a-zA-Z0-9]', '', p["name"])
+                if clean_n:
+                    candidate_folders.add(clean_n)
 
-            for fpath in p["files"]:
-                if os.path.exists(fpath):
+            for cand in candidate_folders:
+                keys_to_export.add(f"Software\\{cand}")
+
+            copied_dirs = set()
+            # Sort so directories are processed before individual files
+            sorted_files = sorted(set(p.get("files", [])), key=lambda x: (len(x), x))
+
+            for fpath in sorted_files:
+                if not os.path.exists(fpath):
+                    continue
+
+                fpath_abs = os.path.abspath(fpath)
+                # If this file is inside an already copied directory bundle, register it without re-copying
+                if any(fpath_abs.startswith(cdir + os.sep) for cdir in copied_dirs):
                     rel = os.path.relpath(fpath, drive_c_src)
-                    if rel.startswith(".."):
-                        continue
-                    dest_file = os.path.join(drive_dest, rel)
-                    os.makedirs(os.path.dirname(dest_file), exist_ok=True)
-                    if os.path.isdir(fpath):
-                        if os.path.exists(dest_file):
-                            shutil.rmtree(dest_file)
-                        shutil.copytree(fpath, dest_file)
-                    else:
-                        shutil.copy2(fpath, dest_file)
+                    if not rel.startswith("..") and rel not in p_entry["files"]:
+                        p_entry["files"].append(rel)
+                    continue
+
+                rel = os.path.relpath(fpath, drive_c_src)
+                if rel.startswith(".."):
+                    continue
+
+                dest_file = os.path.join(drive_dest, rel)
+                os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+
+                if os.path.isdir(fpath):
+                    if os.path.exists(dest_file):
+                        shutil.rmtree(dest_file, ignore_errors=True)
+                    shutil.copytree(fpath, dest_file, symlinks=False)
+                    copied_dirs.add(fpath_abs)
+                    for root_s, _, fn_list in os.walk(dest_file):
+                        for fn in fn_list:
+                            rel_f = os.path.relpath(os.path.join(root_s, fn), drive_dest)
+                            if rel_f not in p_entry["files"]:
+                                p_entry["files"].append(rel_f)
+                else:
+                    if os.path.exists(dest_file):
+                        try:
+                            os.chmod(dest_file, 0o666)
+                            os.remove(dest_file)
+                        except Exception:
+                            pass
+                    shutil.copy2(fpath, dest_file)
                     if rel not in p_entry["files"]:
                         p_entry["files"].append(rel)
 
-            if p["vendor"] and p["vendor"] != "Desconocido":
-                wine_users = get_wine_users(drive_c_src)
+            wine_users = get_wine_users(drive_c_src)
+            for cand in candidate_folders:
                 for u_name in wine_users:
                     for sub in [
-                        os.path.join("users", u_name, "AppData", "Roaming", p["vendor"]),
-                        os.path.join("users", u_name, "AppData", "Local", p["vendor"]),
-                        os.path.join("users", u_name, "Documents", p["vendor"]),
+                        os.path.join("users", u_name, "AppData", "Roaming", cand),
+                        os.path.join("users", u_name, "AppData", "Local", cand),
+                        os.path.join("users", u_name, "Documents", cand),
                     ]:
                         src_sub = os.path.join(drive_c_src, sub)
                         if os.path.exists(src_sub):
@@ -857,21 +918,27 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                             os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
                             if os.path.isdir(src_sub):
                                 if not os.path.exists(dest_sub):
-                                    shutil.copytree(src_sub, dest_sub)
+                                    shutil.copytree(src_sub, dest_sub, symlinks=False)
                                 for root_s, _, fn_list in os.walk(dest_sub):
                                     for fn in fn_list:
                                         rel_f = os.path.relpath(os.path.join(root_s, fn), drive_dest)
                                         if rel_f not in p_entry["files"]:
                                             p_entry["files"].append(rel_f)
                             else:
+                                if os.path.exists(dest_sub):
+                                    try:
+                                        os.chmod(dest_sub, 0o666)
+                                        os.remove(dest_sub)
+                                    except Exception:
+                                        pass
                                 shutil.copy2(src_sub, dest_sub)
                                 rel_f = os.path.relpath(dest_sub, drive_dest)
                                 if rel_f not in p_entry["files"]:
                                     p_entry["files"].append(rel_f)
 
                 for sub in [
-                    os.path.join("users", "Public", "Documents", p["vendor"]),
-                    os.path.join("ProgramData", p["vendor"]),
+                    os.path.join("users", "Public", "Documents", cand),
+                    os.path.join("ProgramData", cand),
                 ]:
                     src_sub = os.path.join(drive_c_src, sub)
                     if os.path.exists(src_sub):
@@ -879,13 +946,19 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                         os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
                         if os.path.isdir(src_sub):
                             if not os.path.exists(dest_sub):
-                                shutil.copytree(src_sub, dest_sub)
+                                shutil.copytree(src_sub, dest_sub, symlinks=False)
                             for root_s, _, fn_list in os.walk(dest_sub):
                                 for fn in fn_list:
                                     rel_f = os.path.relpath(os.path.join(root_s, fn), drive_dest)
                                     if rel_f not in p_entry["files"]:
                                         p_entry["files"].append(rel_f)
                         else:
+                            if os.path.exists(dest_sub):
+                                try:
+                                    os.chmod(dest_sub, 0o666)
+                                    os.remove(dest_sub)
+                                except Exception:
+                                    pass
                             shutil.copy2(src_sub, dest_sub)
                             rel_f = os.path.relpath(dest_sub, drive_dest)
                             if rel_f not in p_entry["files"]:
