@@ -527,7 +527,6 @@ class InstallWorker(QtCore.QThread):
                         
                     # Convert manifest.json to vst_tracker receipts to remember dependencies
                     try:
-                        import json, time, re
                         with open(file_path, "r", encoding="utf-8") as mf:
                             manifest_data = json.load(mf)
                         
@@ -1596,7 +1595,6 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
             os.makedirs(tracker_dir, exist_ok=True)
             stem = re.sub(r'[^a-zA-Z0-9_]', '_', item)
-            import time
             receipt_path = os.path.join(tracker_dir, f"{stem}_manual_patch_{int(time.time())}.json")
             receipt_data = {
                 "installer": "Manual Patch/Crack/License",
@@ -1605,7 +1603,6 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 "reg_lines_count": num_regs,
                 "reg_diff": diff["new_reg_lines"]
             }
-            import json
             with open(receipt_path, "w", encoding="utf-8") as rpf:
                 json.dump(receipt_data, rpf, indent=2)
             
@@ -1825,7 +1822,6 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             receipts_to_delete = []
             p_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', p["name"]).lower()
             if os.path.isdir(tracker_dir):
-                import json
                 for rf in os.listdir(tracker_dir):
                     if rf.endswith(".json"):
                         rpath = os.path.join(tracker_dir, rf)
