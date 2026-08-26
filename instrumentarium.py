@@ -308,7 +308,7 @@ def sync_wineserver(wine_root: str, prefix: str, timeout: int = 10):
 
 
 def walk_prefix_files(drive_c: str):
-    """Walks all prefix files including symlinked user Document/Music directories, yielding normalized virtual paths under drive_c."""
+    """Walks all prefix files including symlinked user directories (Documents, Music, etc.), yielding normalized virtual paths under drive_c."""
     if not os.path.isdir(drive_c):
         return
 
@@ -317,21 +317,30 @@ def walk_prefix_files(drive_c: str):
         for f in filenames:
             yield os.path.join(root, f)
 
-    # 2. Walk symlinked user folders (Documents, Music) to capture presets installed outside drive_c root
+    # 2. Dynamically walk all symlinked user folders (Documents, Music, etc.) to capture presets installed outside drive_c root
     users = get_wine_users(drive_c)
+    home_real = os.path.realpath(os.path.expanduser("~"))
     for u in users:
-        for folder_name in ["Documents", "Music"]:
-            user_sub = os.path.join(drive_c, "users", u, folder_name)
-            if os.path.islink(user_sub) and os.path.isdir(user_sub):
-                real_target = os.path.realpath(user_sub)
-                for root, _, filenames in os.walk(real_target):
-                    rel_inside = os.path.relpath(root, real_target)
-                    for f in filenames:
-                        if rel_inside == ".":
-                            virtual_fp = os.path.join(user_sub, f)
-                        else:
-                            virtual_fp = os.path.join(user_sub, rel_inside, f)
-                        yield virtual_fp
+        u_dir = os.path.join(drive_c, "users", u)
+        if os.path.isdir(u_dir):
+            try:
+                for entry in os.listdir(u_dir):
+                    user_sub = os.path.join(u_dir, entry)
+                    if os.path.islink(user_sub) and os.path.isdir(user_sub):
+                        real_target = os.path.realpath(user_sub)
+                        # Avoid walking whole home directory if user symlinked ~ itself
+                        if real_target == home_real:
+                            continue
+                        for root, _, filenames in os.walk(real_target):
+                            rel_inside = os.path.relpath(root, real_target)
+                            for f in filenames:
+                                if rel_inside == ".":
+                                    virtual_fp = os.path.join(user_sub, f)
+                                else:
+                                    virtual_fp = os.path.join(user_sub, rel_inside, f)
+                                yield virtual_fp
+            except Exception:
+                pass
 
 
 def take_prefix_snapshot(prefix: str, wine_root: str = "") -> dict:
