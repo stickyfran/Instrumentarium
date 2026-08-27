@@ -96,6 +96,20 @@ def get_primary_wine_user(drive_c: str) -> str:
     return users[0] if users else "user"
 
 
+def to_agnostic_relpath(rel_path: str) -> str:
+    """Converts local user directory paths (users/kes/...) to neutral agnostic paths (users/User/...)
+    so that user profile names are never leaked into .vstpack bundles or UI agnostic paths."""
+    if not rel_path:
+        return rel_path
+    norm = rel_path.replace("\\", "/")
+    parts = norm.split("/")
+    if len(parts) >= 2 and parts[0].lower() == "users":
+        if parts[1].lower() not in ["public", "all users", "default", "default user"]:
+            parts[1] = "User"
+            return os.path.join(*parts)
+    return rel_path
+
+
 def is_product_tracked(product: dict, wine_prefix: str) -> bool:
     tracker_dir = os.path.join(wine_prefix, ".vst_tracker")
     if not os.path.isdir(tracker_dir):
@@ -521,9 +535,10 @@ class InstallWorker(QtCore.QThread):
             row = item['row']
             file_path = item['path']
             filename = os.path.basename(file_path)
-            self.progress.emit(idx + 1, total, filename)
+            display_name = item.get('display_name') or filename
+            self.progress.emit(idx + 1, total, display_name)
             self.item_status.emit(row, "Instalando...", "#d97706")
-            self.log_message.emit(f"\n--- [{idx+1}/{total}] Procesando: {filename} ---")
+            self.log_message.emit(f"\n--- [{idx+1}/{total}] Procesando: {display_name} ---")
 
             try:
                 # 0. VSTPack Manifest Restore
@@ -540,8 +555,9 @@ class InstallWorker(QtCore.QThread):
                             # Match target user folder dynamically
                             rel_parts = rel.split(os.sep)
                             if len(rel_parts) >= 2 and rel_parts[0].lower() == "users":
-                                rel_parts[1] = target_wine_user
-                                rel = os.path.join(*rel_parts)
+                                if rel_parts[1].lower() not in ["public", "all users", "default", "default user"]:
+                                    rel_parts[1] = target_wine_user
+                                    rel = os.path.join(*rel_parts)
 
                             dest_folder = os.path.join(self.get_drive_c(), rel)
                             os.makedirs(dest_folder, exist_ok=True)
@@ -554,7 +570,39 @@ class InstallWorker(QtCore.QThread):
                     reg_src = os.path.join(base_dir, "registry.reg")
                     if os.path.isfile(reg_src):
                         self.log_message.emit(f"Inyectando claves de registro ({reg_src})...")
-                        subprocess.run([wine_bin, "regedit", reg_src], env=env)
+                        try:
+                            with open(reg_src, "rb") as rf:
+                                raw_bytes = rf.read()
+                            
+                            import codecs
+                            if raw_bytes.startswith(codecs.BOM_UTF16_LE):
+                                reg_text = raw_bytes.decode("utf-16le", errors="ignore")
+                                is_utf16 = True
+                            else:
+                                reg_text = raw_bytes.decode("utf-8", errors="ignore")
+                                is_utf16 = False
+
+                            # Dynamically map C:\users\User to C:\users\<target_wine_user>
+                            pat = r'([Cc]:(?:\\\\|\\|/)+[Uu][Ss][Ee][Rr][Ss](?:\\\\|\\|/)+)User((?:\\\\|\\|/)+|$)'
+                            patched_reg = re.sub(pat, rf'\g<1>{target_wine_user}\2', reg_text)
+
+                            temp_reg = os.path.join(tempfile.gettempdir(), f"instrumentarium_import_{int(time.time())}.reg")
+                            if is_utf16:
+                                with open(temp_reg, "w", encoding="utf-16le", newline="\r\n") as wf:
+                                    wf.write('\ufeff')
+                                    wf.write(patched_reg)
+                            else:
+                                with open(temp_reg, "w", encoding="utf-8") as wf:
+                                    wf.write(patched_reg)
+
+                            subprocess.run([wine_bin, "regedit", temp_reg], env=env)
+                            try:
+                                os.remove(temp_reg)
+                            except Exception:
+                                pass
+                        except Exception:
+                            subprocess.run([wine_bin, "regedit", reg_src], env=env)
+
                         self.log_message.emit("✓ Registro de Windows restaurado.")
                         
                     # Convert manifest.json to vst_tracker receipts to remember dependencies
@@ -574,8 +622,9 @@ class InstallWorker(QtCore.QThread):
                                 rel_f = f
                                 rel_parts = rel_f.split(os.sep)
                                 if len(rel_parts) >= 2 and rel_parts[0].lower() == "users":
-                                    rel_parts[1] = target_wine_user
-                                    rel_f = os.path.join(*rel_parts)
+                                    if rel_parts[1].lower() not in ["public", "all users", "default", "default user"]:
+                                        rel_parts[1] = target_wine_user
+                                        rel_f = os.path.join(*rel_parts)
                                 abs_files.append(os.path.join(self.get_drive_c(), rel_f))
                                 
                             receipt_data = {
@@ -789,6 +838,13 @@ def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: 
     and merges any captured diffs from receipts, with ZERO Wine GUI popups or processes."""
     output_lines = ["Windows Registry Editor Version 5.00\n"]
     seen_sections = set()
+    wine_users = get_wine_users(os.path.join(wine_prefix, "drive_c")) if not is_windows else []
+
+    def sanitize_registry_line(line_str: str) -> str:
+        for u_name in wine_users:
+            pat = r'([Cc]:(?:\\\\|\\|/)+[Uu][Ss][Ee][Rr][Ss](?:\\\\|\\|/)+)' + re.escape(u_name) + r'((?:\\\\|\\|/)+|$)'
+            line_str = re.sub(pat, r'\g<1>User\2', line_str)
+        return line_str
 
     # 1. First add registry diffs from receipts
     if receipts:
@@ -806,7 +862,7 @@ def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: 
                             seen_sections.add(sec_header)
                             output_lines.append(f"\n[{sec_header}]\n")
                     elif line_clean and not line_clean.startswith("Windows Registry Editor"):
-                        output_lines.append(line + ("\n" if not line.endswith("\n") else ""))
+                        output_lines.append(sanitize_registry_line(line) + ("\n" if not line.endswith("\n") else ""))
 
     if is_windows:
         return "".join(output_lines)
@@ -836,6 +892,17 @@ def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: 
                 return True
             return False
 
+        def unescape_wine_hex(match):
+            hex_str = match.group(0)
+            try:
+                raw_bytes = bytes.fromhex(hex_str.replace('\\x', ''))
+                return raw_bytes.decode('utf-8')
+            except Exception:
+                try:
+                    return raw_bytes.decode('cp1252', errors='replace')
+                except Exception:
+                    return hex_str
+
         try:
             with open(reg_path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
@@ -845,7 +912,7 @@ def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: 
                         raw_sec_clean = raw_sec.split("]")[0].strip()
                         current_full_sec = f"{default_hive}\\{raw_sec_clean}" if not raw_sec_clean.startswith("HKEY_") else raw_sec_clean
                         current_full_sec = re.sub(r'\\+', r'\\', current_full_sec)
-                        sec_lower = raw_sec_clean.lower()
+                        sec_lower = re.sub(r'\\+', r'\\', raw_sec_clean.lower())
 
                         section_matches = any(match_target(sec_lower, t) for t in targets)
 
@@ -859,7 +926,9 @@ def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: 
                         if stripped.startswith("#") or stripped.startswith(";"):
                             continue
                         if stripped:
-                            output_lines.append(line if line.endswith("\n") else line + "\n")
+                            decoded_line = re.sub(r'(?<!\\)(?:\\x[0-9a-fA-F]{2})+', unescape_wine_hex, line)
+                            decoded_line = sanitize_registry_line(decoded_line)
+                            output_lines.append(decoded_line if decoded_line.endswith("\n") else decoded_line + "\n")
                         elif output_lines and output_lines[-1] != "\n":
                             output_lines.append("\n")
         except Exception:
@@ -967,15 +1036,18 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                 # If this file is inside an already copied directory bundle, register it without re-copying
                 if any(fpath_abs.startswith(cdir + os.sep) for cdir in copied_dirs):
                     rel = os.path.relpath(fpath, drive_c_src)
-                    if not rel.startswith("..") and rel not in p_entry["files"]:
-                        p_entry["files"].append(rel)
+                    if not rel.startswith(".."):
+                        agnostic_rel = to_agnostic_relpath(rel)
+                        if agnostic_rel not in p_entry["files"]:
+                            p_entry["files"].append(agnostic_rel)
                     continue
 
                 rel = os.path.relpath(fpath, drive_c_src)
                 if rel.startswith(".."):
                     continue
 
-                dest_file = os.path.join(drive_dest, rel)
+                agnostic_rel = to_agnostic_relpath(rel)
+                dest_file = os.path.join(drive_dest, agnostic_rel)
                 os.makedirs(os.path.dirname(dest_file), exist_ok=True)
 
                 if os.path.isdir(fpath):
@@ -996,8 +1068,8 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                         except Exception:
                             pass
                     shutil.copy2(fpath, dest_file)
-                    if rel not in p_entry["files"]:
-                        p_entry["files"].append(rel)
+                    if agnostic_rel not in p_entry["files"]:
+                        p_entry["files"].append(agnostic_rel)
 
             wine_users = get_wine_users(drive_c_src)
             for cand in candidate_folders:
@@ -1009,7 +1081,8 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
                     ]:
                         src_sub = os.path.join(drive_c_src, sub)
                         if os.path.exists(src_sub):
-                            dest_sub = os.path.join(drive_dest, sub)
+                            sub_agnostic = to_agnostic_relpath(sub)
+                            dest_sub = os.path.join(drive_dest, sub_agnostic)
                             os.makedirs(os.path.dirname(dest_sub), exist_ok=True)
                             if os.path.isdir(src_sub):
                                 if not os.path.exists(dest_sub):
@@ -1064,7 +1137,8 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
         # Export Registry
         reg_file = os.path.join(temp_dir, "registry.reg")
         reg_content = extract_wine_registry_keys(wine_prefix, keys_to_export, receipts, is_windows)
-        with open(reg_file, "w", encoding="utf-8") as rf:
+        with open(reg_file, "w", encoding="utf-16le", newline='\r\n') as rf:
+            rf.write('\ufeff')
             rf.write(reg_content)
 
         # Write manifest.json
@@ -1134,7 +1208,13 @@ echo   [OK] Presets, samples y librerias de usuario actualizados.
 :: 6. Inyectar Registro de Windows
 if exist "registry.reg" (
     echo [6/6] Importando claves y licencias del Registro...
-    regedit.exe /s "registry.reg"
+    powershell -NoProfile -Command "$content = [System.IO.File]::ReadAllText('registry.reg'); $patched = [System.Text.RegularExpressions.Regex]::Replace($content, '([C-Zc-z]:[\\/]+[Uu]sers[\\/]+)User([\\/]+|$)', ('${1}' + $env:USERNAME + '${2}'), [System.Text.RegularExpressions.RegexOptions]::IgnoreCase); [System.IO.File]::WriteAllText('temp_import.reg', $patched, [System.Text.Encoding]::Unicode);" >nul 2>&1
+    if exist "temp_import.reg" (
+        regedit.exe /s "temp_import.reg"
+        del "temp_import.reg" >nul 2>&1
+    ) else (
+        regedit.exe /s "registry.reg"
+    )
     echo   [OK] Registro de Windows actualizado exitosamente.
 )
 
@@ -1198,7 +1278,33 @@ if [ -f "$here/registry.reg" ]; then
     WINE_ROOT="$(ls -d "$HOME/.local/opt"/wine-d2d1-nspa-* 2>/dev/null | grep -v 'rollback' | sort -V | tail -1 || true)"
     WINE_BIN="${WINE_ROOT:-/usr}/bin/wine"
     if [ -x "$WINE_BIN" ]; then
-        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE_BIN" regedit "$here/registry.reg"
+        TARGET_USER="$(ls "$PREFIX/drive_c/users" 2>/dev/null | grep -viE '^(public|default|all users|default user)$' | head -n 1 || echo "${USER:-user}")"
+        TEMP_REG="/tmp/vstpack_restore_$$.reg"
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c "
+import sys, re, codecs
+with open('$here/registry.reg', 'rb') as f:
+    b = f.read()
+if b.startswith(codecs.BOM_UTF16_LE):
+    t = b.decode('utf-16le')
+    is_u16 = True
+else:
+    t = b.decode('utf-8', errors='ignore')
+    is_u16 = False
+pat = r'([Cc]:(?:\\\\\\\\|\\\\|/)+[Uu][Ss][Ee][Rr][Ss](?:\\\\\\\\|\\\\|/)+)User((?:\\\\\\\\|\\\\|/)+|$)'
+t = re.sub(pat, r'\g<1>$TARGET_USER\2', t, flags=re.IGNORECASE)
+if is_u16:
+    with open('$TEMP_REG', 'w', encoding='utf-16le', newline='\r\n') as f:
+        f.write('\ufeff' + t)
+else:
+    with open('$TEMP_REG', 'w', encoding='utf-8') as f:
+        f.write(t)
+" 2>/dev/null || cp "$here/registry.reg" "$TEMP_REG"
+        else
+            cp "$here/registry.reg" "$TEMP_REG"
+        fi
+        WINEPREFIX="$PREFIX" WINEDEBUG=-all "$WINE_BIN" regedit "$TEMP_REG"
+        rm -f "$TEMP_REG" 2>/dev/null || true
         echo "  [OK] Registro actualizado."
     else
         echo "  [!] No se pudo invocar wine automáticamente para inyectar registry.reg."
@@ -1394,8 +1500,9 @@ def get_product_detailed_info(product: dict, wine_prefix: str) -> dict:
             except Exception:
                 sz = 0
 
-            # Relative path
+            # Relative path (Agnostic for package destination)
             rel = os.path.relpath(fp, drive_c) if not os.path.relpath(fp, drive_c).startswith("..") else fp
+            rel_agnostic = to_agnostic_relpath(rel)
 
             # Category
             norm = fp.replace("\\", "/").lower()
@@ -1418,7 +1525,7 @@ def get_product_detailed_info(product: dict, wine_prefix: str) -> dict:
 
             classified_files.append({
                 "path": fp,
-                "relpath": rel,
+                "relpath": rel_agnostic,
                 "size": sz,
                 "category": cat
             })
@@ -1451,7 +1558,12 @@ def inspect_vstpack_data(vstpack_path: str) -> dict:
         reg_content = ""
         if "registry.reg" in z.namelist():
             try:
-                reg_content = z.read("registry.reg").decode("utf-8", errors="ignore")
+                raw_reg = z.read("registry.reg")
+                import codecs
+                if raw_reg.startswith(codecs.BOM_UTF16_LE):
+                    reg_content = raw_reg.decode("utf-16le", errors="ignore")
+                else:
+                    reg_content = raw_reg.decode("utf-8", errors="ignore")
             except Exception:
                 pass
 
@@ -3014,12 +3126,23 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         # Queue Table
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Nombre", "Tipo", "Ruta de Origen", "Estado"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "Producto / Plugin", 
+            "Fabricante", 
+            "Formatos / Tipo", 
+            "Versión", 
+            "Tamaño Total", 
+            "Ruta de Origen", 
+            "Estado"
+        ])
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         layout.addWidget(self.table)
@@ -3817,22 +3940,125 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
 
-        name_item = QtWidgets.QTableWidgetItem(os.path.basename(path))
-        type_item = QtWidgets.QTableWidgetItem(item_type)
-        path_item = QtWidgets.QTableWidgetItem(path)
-        status_item = QtWidgets.QTableWidgetItem("Pendiente")
+        prod_name = os.path.basename(path)
+        vendor = "Desconocido"
+        formats = item_type
+        version = "-"
+        total_size_bytes = 0
 
-        self.table.setItem(row, 0, name_item)
-        self.table.setItem(row, 1, type_item)
-        self.table.setItem(row, 2, path_item)
-        self.table.setItem(row, 3, status_item)
+        fl = path.lower()
+        if fl.endswith("manifest.json") or item_type == "Paquete VSTPack":
+            try:
+                with open(path, "r", encoding="utf-8") as mf:
+                    mdata = json.load(mf)
+                prods = mdata.get("products", [])
+                if prods:
+                    names = [p.get("name", "Plugin") for p in prods if p.get("name")]
+                    if names:
+                        prod_name = ", ".join(names)
+                    v_list = [p.get("vendor") for p in prods if p.get("vendor") and p.get("vendor") != "Desconocido"]
+                    if v_list:
+                        vendor = ", ".join(list(dict.fromkeys(v_list)))
+                    f_list = [fmt for p in prods for fmt in p.get("formats", [])]
+                    if f_list:
+                        formats = ", ".join(list(dict.fromkeys(f_list))) + " (VSTPack)"
+                    else:
+                        formats = "Paquete VSTPack"
+                    ver_list = [p.get("version") for p in prods if p.get("version")]
+                    if ver_list:
+                        version = ", ".join(list(dict.fromkeys(ver_list)))
+            except Exception:
+                pass
+
+            # Calculate uncompressed size of the entire bundle
+            base_dir = os.path.dirname(path)
+            if os.path.isdir(base_dir):
+                for root_d, _, files_in_d in os.walk(base_dir):
+                    for f_in in files_in_d:
+                        fp_in = os.path.join(root_d, f_in)
+                        if not os.path.islink(fp_in):
+                            try:
+                                total_size_bytes += os.path.getsize(fp_in)
+                            except Exception:
+                                pass
+        elif fl.endswith(".vst3"):
+            prod_name = re.sub(r'\.vst3$', '', prod_name, flags=re.IGNORECASE)
+            formats = "VST3 Plugin"
+            if os.path.isdir(path):
+                formats = "VST3 Bundle"
+                for root_d, _, files_in_d in os.walk(path):
+                    for f_in in files_in_d:
+                        try:
+                            total_size_bytes += os.path.getsize(os.path.join(root_d, f_in))
+                        except Exception:
+                            pass
+            elif os.path.isfile(path):
+                try:
+                    total_size_bytes = os.path.getsize(path)
+                except Exception:
+                    pass
+        elif fl.endswith(".clap"):
+            prod_name = re.sub(r'\.clap$', '', prod_name, flags=re.IGNORECASE)
+            formats = "CLAP Plugin"
+            if os.path.isfile(path):
+                try:
+                    total_size_bytes = os.path.getsize(path)
+                except Exception:
+                    pass
+        elif fl.endswith(".dll"):
+            prod_name = re.sub(r'\.dll$', '', prod_name, flags=re.IGNORECASE)
+            formats = "VST2 DLL (x64)"
+            if os.path.isfile(path):
+                try:
+                    total_size_bytes = os.path.getsize(path)
+                except Exception:
+                    pass
+        elif fl.endswith(".exe"):
+            prod_name = re.sub(r'\.exe$', '', prod_name, flags=re.IGNORECASE)
+            formats = "Instalador EXE"
+            if os.path.isfile(path):
+                try:
+                    total_size_bytes = os.path.getsize(path)
+                except Exception:
+                    pass
+
+        size_str = format_file_size(total_size_bytes) if total_size_bytes > 0 else "-"
+
+        item_name = QtWidgets.QTableWidgetItem(prod_name)
+        item_name.setFont(QtGui.QFont("Segoe UI", 9, QtGui.QFont.Weight.Bold))
+        if "VSTPack" in formats:
+            item_name.setIcon(get_system_icon("package-x-generic", "📦"))
+        elif "VST3" in formats:
+            item_name.setIcon(get_system_icon("audio-x-generic", "🎵"))
+        elif "EXE" in formats:
+            item_name.setIcon(get_system_icon("application-x-executable", "⚙️"))
+        else:
+            item_name.setIcon(get_system_icon("application-x-sharedlib", "🧩"))
+
+        item_vendor = QtWidgets.QTableWidgetItem(vendor)
+        item_formats = QtWidgets.QTableWidgetItem(formats)
+        item_ver = QtWidgets.QTableWidgetItem(version)
+        item_size = QtWidgets.QTableWidgetItem(size_str)
+        item_path = QtWidgets.QTableWidgetItem(path)
+        item_path.setToolTip(path)
+        item_status = QtWidgets.QTableWidgetItem("Pendiente")
+        item_status.setForeground(QtGui.QColor("#64748b"))
+
+        self.table.setItem(row, 0, item_name)
+        self.table.setItem(row, 1, item_vendor)
+        self.table.setItem(row, 2, item_formats)
+        self.table.setItem(row, 3, item_ver)
+        self.table.setItem(row, 4, item_size)
+        self.table.setItem(row, 5, item_path)
+        self.table.setItem(row, 6, item_status)
 
         self.queue_items.append({
             'path': path,
             'type': item_type,
+            'display_name': prod_name,
             'row': row
         })
-        self.lbl_status.setText(f"{len(self.queue_items)} elementos en la cola.")
+        self.lbl_status.setText(f"{len(self.queue_items)} elemento(s) en la cola de instalación.")
 
     def clear_list(self):
         self.table.setRowCount(0)
@@ -3877,7 +4103,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.lbl_status.setText(f"Instalando [{current}/{total}]: {name}")
 
     def on_item_status(self, row, status_text, color_hex):
-        item = self.table.item(row, 3)
+        item = self.table.item(row, self.table.columnCount() - 1)
         if item:
             item.setText(status_text)
             item.setForeground(QtGui.QColor(color_hex))
