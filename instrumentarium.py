@@ -795,7 +795,6 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "source_os": "Windows (Native)" if is_windows else "Linux (Wine)",
             "compatibility": ["Linux (Instrumentarium)", "Windows 10/11 (Native)"],
-            "source_prefix": wine_prefix,
             "products": []
         }
 
@@ -1748,7 +1747,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
 
         table_files = QtWidgets.QTableWidget()
         table_files.setColumnCount(4)
-        table_files.setHorizontalHeaderLabels(["Ruta Relativa / Archivo", "Categoría / Ubicación", "Tamaño", "Ruta Absoluta"])
+        table_files.setHorizontalHeaderLabels(["Ruta Relativa en Paquete (Agnóstica)", "Categoría / Ubicación", "Tamaño", "Ruta Absoluta en este Sistema"])
         table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
