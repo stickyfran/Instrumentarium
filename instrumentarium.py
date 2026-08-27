@@ -1237,6 +1237,763 @@ class ExportWorker(QtCore.QThread):
         except Exception as e:
             self.finished.emit(False, str(e))
 
+
+def format_file_size(size_bytes: int) -> str:
+    """Formats bytes into human readable string (KB, MB, GB)."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
+
+
+def get_product_detailed_info(product: dict, wine_prefix: str) -> dict:
+    """Gathers all binaries, receipts, documents/preset files, AppData, and registry keys for a product."""
+    drive_c = get_drive_c_path(wine_prefix)
+    p_files = list(product.get("files", []))
+    p_files_set = set(p_files)
+    tracker_dir = os.path.join(wine_prefix, ".vst_tracker")
+    receipts = []
+    p_name_clean = re.sub(r'[^a-zA-Z0-9_]', '_', product.get("name", "")).lower()
+
+    # Find matching receipts
+    if os.path.isdir(tracker_dir):
+        for rf in os.listdir(tracker_dir):
+            if rf.endswith(".json"):
+                rpath = os.path.join(tracker_dir, rf)
+                try:
+                    with open(rpath, "r", encoding="utf-8") as rf_fd:
+                        rdata = json.load(rf_fd)
+                        r_files = rdata.get("new_files", [])
+                        rf_stem = os.path.splitext(rf)[0].lower()
+                        name_match = (rf_stem == p_name_clean or rf_stem.startswith(f"{p_name_clean}_"))
+                        match = any(f_ in p_files_set for f_ in r_files) or (p_name_clean and name_match)
+                        if not match:
+                            for pf in p_files_set:
+                                pf_dir = pf if pf.endswith(os.sep) else pf + os.sep
+                                if any(rf_.startswith(pf_dir) for rf_ in r_files):
+                                    match = True
+                                    break
+                        if match:
+                            receipts.append({"filename": rf, "data": rdata})
+                            for f in r_files:
+                                if f not in p_files_set and os.path.exists(f):
+                                    p_files.append(f)
+                                    p_files_set.add(f)
+                except Exception:
+                    pass
+
+    # Check candidate folders in Documents, AppData, ProgramData
+    candidate_folders = set()
+    if product.get("vendor") and product["vendor"] != "Desconocido":
+        candidate_folders.add(product["vendor"])
+    if product.get("name"):
+        candidate_folders.add(product["name"])
+        clean_n = re.sub(r'[^a-zA-Z0-9]', '', product["name"])
+        if clean_n:
+            candidate_folders.add(clean_n)
+
+    wine_users = get_wine_users(drive_c)
+    for cand in candidate_folders:
+        for u_name in wine_users:
+            for sub in [
+                os.path.join("users", u_name, "AppData", "Roaming", cand),
+                os.path.join("users", u_name, "AppData", "Local", cand),
+                os.path.join("users", u_name, "Documents", cand),
+            ]:
+                src_sub = os.path.join(drive_c, sub)
+                if os.path.exists(src_sub):
+                    if os.path.isdir(src_sub):
+                        for root_s, _, fn_list in os.walk(src_sub):
+                            for fn in fn_list:
+                                full_fp = os.path.join(root_s, fn)
+                                if full_fp not in p_files_set:
+                                    p_files.append(full_fp)
+                                    p_files_set.add(full_fp)
+                    elif src_sub not in p_files_set:
+                        p_files.append(src_sub)
+                        p_files_set.add(src_sub)
+
+        for sub in [
+            os.path.join("users", "Public", "Documents", cand),
+            os.path.join("ProgramData", cand),
+        ]:
+            src_sub = os.path.join(drive_c, sub)
+            if os.path.exists(src_sub):
+                if os.path.isdir(src_sub):
+                    for root_s, _, fn_list in os.walk(src_sub):
+                        for fn in fn_list:
+                            full_fp = os.path.join(root_s, fn)
+                            if full_fp not in p_files_set:
+                                p_files.append(full_fp)
+                                p_files_set.add(full_fp)
+                elif src_sub not in p_files_set:
+                    p_files.append(src_sub)
+                    p_files_set.add(src_sub)
+
+    # Classify files with sizes
+    classified_files = []
+    for fp in p_files:
+        if os.path.exists(fp):
+            try:
+                sz = os.path.getsize(fp) if not os.path.isdir(fp) else 0
+            except Exception:
+                sz = 0
+
+            # Relative path
+            rel = os.path.relpath(fp, drive_c) if not os.path.relpath(fp, drive_c).startswith("..") else fp
+
+            # Category
+            norm = fp.replace("\\", "/").lower()
+            if ".vst3" in norm:
+                cat = "Binario VST3"
+            elif ".dll" in norm:
+                cat = "Binario VST2 (DLL)"
+            elif ".clap" in norm:
+                cat = "Binario CLAP"
+            elif ".exe" in norm:
+                cat = "Standalone / Utilidad"
+            elif "/documents/" in norm or "/documentos/" in norm:
+                cat = "Presets / Librería (Documentos)"
+            elif "/appdata/roaming/" in norm or "/appdata/local/" in norm:
+                cat = "Configuración / Datos (AppData)"
+            elif "/programdata/" in norm:
+                cat = "Datos Compartidos (ProgramData)"
+            else:
+                cat = "Otro Archivo"
+
+            classified_files.append({
+                "path": fp,
+                "relpath": rel,
+                "size": sz,
+                "category": cat
+            })
+
+    # Registry keys
+    reg_lines = []
+    for r in receipts:
+        reg_lines.extend(r["data"].get("reg_diff", []))
+
+    return {
+        "product": product,
+        "files": classified_files,
+        "receipts": receipts,
+        "reg_lines": reg_lines,
+        "is_tracked": len(receipts) > 0,
+        "total_size": sum(f["size"] for f in classified_files)
+    }
+
+
+def inspect_vstpack_data(vstpack_path: str) -> dict:
+    """Extracts manifest, file list with uncompressed sizes, and registry contents from a .vstpack archive."""
+    with zipfile.ZipFile(vstpack_path, "r") as z:
+        manifest = {}
+        if "manifest.json" in z.namelist():
+            try:
+                manifest = json.loads(z.read("manifest.json").decode("utf-8"))
+            except Exception:
+                pass
+
+        reg_content = ""
+        if "registry.reg" in z.namelist():
+            try:
+                reg_content = z.read("registry.reg").decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        files_info = []
+        for info in z.infolist():
+            if info.is_dir() or info.filename in ["manifest.json", "registry.reg", "install_linux.sh", "install_windows.bat"]:
+                continue
+            files_info.append({
+                "path": info.filename,
+                "size": info.file_size,
+                "compressed_size": info.compress_size
+            })
+
+        return {
+            "path": vstpack_path,
+            "manifest": manifest,
+            "reg_content": reg_content,
+            "files": files_info,
+            "total_size": sum(f["size"] for f in files_info)
+        }
+
+
+class ProductDetailsDialog(QtWidgets.QDialog):
+    """Inspects all tracked files, presets, AppData, registry keys, and installation receipts for a product or .vstpack package."""
+    def __init__(self, parent=None, product=None, vstpack_path=None, wine_prefix="", wine_root="", is_windows=False):
+        super().__init__(parent)
+        self.product = product
+        self.vstpack_path = vstpack_path
+        self.wine_prefix = wine_prefix
+        self.wine_root = wine_root
+        self.is_windows = is_windows
+        self.setMinimumSize(880, 620)
+        self.resize(960, 680)
+
+        if self.vstpack_path:
+            self.setWindowTitle(f"Inspección de Paquete: {os.path.basename(self.vstpack_path)}")
+            self.init_from_vstpack()
+        else:
+            p_name = self.product.get("name", "Plugin") if self.product else "Plugin"
+            self.setWindowTitle(f"Detalles y ADN del Plugin: {p_name}")
+            self.init_from_product()
+
+    def init_from_product(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        data = get_product_detailed_info(self.product, self.wine_prefix)
+        p = data["product"]
+        files = data["files"]
+        receipts = data["receipts"]
+        reg_lines = data["reg_lines"]
+
+        # Header card
+        header_card = QtWidgets.QFrame()
+        header_card.setObjectName("HeaderFrame")
+        h_layout = QtWidgets.QHBoxLayout(header_card)
+        h_layout.setContentsMargins(14, 12, 14, 12)
+
+        v_title = QtWidgets.QVBoxLayout()
+        lbl_name = QtWidgets.QLabel(f"<h2>{p.get('name', 'Plugin')}</h2>")
+        lbl_name.setTextFormat(QtCore.Qt.TextFormat.RichText)
+
+        vendor = p.get('vendor', 'Desconocido')
+        ver = p.get('version', '')
+        fmt_str = " • ".join(p.get('formats', ['VST3']))
+        total_sz = format_file_size(data["total_size"])
+        status_text = "✓ Rastreado (Listo para exportar)" if data["is_tracked"] else "⚠️ No Rastreado (Solo binario base)"
+        status_color = "#16a34a" if data["is_tracked"] else "#f59e0b"
+
+        meta_lbl = QtWidgets.QLabel(
+            f"<b>Fabricante:</b> {vendor}  |  "
+            f"<b>Formatos:</b> {fmt_str}  |  "
+            f"<b>Versión:</b> {ver if ver else 'N/A'}  |  "
+            f"<b>Tamaño:</b> {total_sz}  |  "
+            f"<b>Estado:</b> <span style='color: {status_color}; font-weight: bold;'>{status_text}</span>"
+        )
+        meta_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v_title.addWidget(lbl_name)
+        v_title.addWidget(meta_lbl)
+        h_layout.addLayout(v_title)
+        h_layout.addStretch()
+
+        layout.addWidget(header_card)
+
+        # Tab Widget
+        tabs = QtWidgets.QTabWidget()
+
+        # Tab 1: Files
+        tab_files = QtWidgets.QWidget()
+        tf_layout = QtWidgets.QVBoxLayout(tab_files)
+        tf_layout.setContentsMargins(6, 8, 6, 6)
+
+        search_h = QtWidgets.QHBoxLayout()
+        txt_search = QtWidgets.QLineEdit()
+        txt_search.setPlaceholderText("🔍 Filtrar archivos, presets o extensiones (.SerumPreset, .vst3, etc.)...")
+        txt_search.setClearButtonEnabled(True)
+        search_h.addWidget(txt_search)
+        tf_layout.addLayout(search_h)
+
+        table_files = QtWidgets.QTableWidget()
+        table_files.setColumnCount(4)
+        table_files.setHorizontalHeaderLabels(["Ruta Relativa / Archivo", "Categoría / Ubicación", "Tamaño", "Ruta Absoluta"])
+        table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        table_files.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table_files.setAlternatingRowColors(True)
+
+        table_files.setRowCount(len(files))
+        for r_idx, f_info in enumerate(files):
+            item_rel = QtWidgets.QTableWidgetItem(f_info["relpath"])
+            item_cat = QtWidgets.QTableWidgetItem(f_info["category"])
+            item_sz = QtWidgets.QTableWidgetItem(format_file_size(f_info["size"]))
+            item_sz.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            item_abs = QtWidgets.QTableWidgetItem(f_info["path"])
+
+            table_files.setItem(r_idx, 0, item_rel)
+            table_files.setItem(r_idx, 1, item_cat)
+            table_files.setItem(r_idx, 2, item_sz)
+            table_files.setItem(r_idx, 3, item_abs)
+
+        def filter_files_list(text):
+            query = text.lower()
+            for row in range(table_files.rowCount()):
+                match = False
+                for col in [0, 1, 3]:
+                    it = table_files.item(row, col)
+                    if it and query in it.text().lower():
+                        match = True
+                        break
+                table_files.setRowHidden(row, not match)
+
+        txt_search.textChanged.connect(filter_files_list)
+        tf_layout.addWidget(table_files)
+
+        # File actions bar
+        f_actions = QtWidgets.QHBoxLayout()
+        lbl_file_count = QtWidgets.QLabel(f"Total: {len(files)} archivo(s) registrados.")
+        lbl_file_count.setObjectName("SecondaryAccentLabel")
+        f_actions.addWidget(lbl_file_count)
+        f_actions.addStretch()
+
+        btn_open_folder = QtWidgets.QPushButton("Abrir Carpeta Contenedora")
+        btn_open_folder.setIcon(get_system_icon("folder-open", "📂"))
+        def open_selected_file_folder():
+            rows = table_files.selectionModel().selectedRows()
+            if rows:
+                row = rows[0].row()
+                abs_path = table_files.item(row, 3).text()
+                target = abs_path if os.path.isdir(abs_path) else os.path.dirname(abs_path)
+                if os.path.exists(target):
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+            elif files:
+                target = os.path.dirname(files[0]["path"])
+                if os.path.exists(target):
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+
+        btn_open_folder.clicked.connect(open_selected_file_folder)
+
+        btn_copy_paths = QtWidgets.QPushButton("Copiar Rutas")
+        btn_copy_paths.setIcon(get_system_icon("edit-copy", "📋"))
+        def copy_paths_action():
+            rows = table_files.selectionModel().selectedRows()
+            if rows:
+                lines = [table_files.item(r.row(), 3).text() for r in rows]
+            else:
+                lines = [f["path"] for f in files]
+            QtWidgets.QApplication.clipboard().setText("\n".join(lines))
+            QtWidgets.QMessageBox.information(self, "Copiado", f"Se copiaron {len(lines)} ruta(s) al portapapeles.")
+
+        btn_copy_paths.clicked.connect(copy_paths_action)
+
+        f_actions.addWidget(btn_open_folder)
+        f_actions.addWidget(btn_copy_paths)
+        tf_layout.addLayout(f_actions)
+        tabs.addTab(tab_files, get_system_icon("folder", "📁"), f"Archivos ({len(files)})")
+
+        # Tab 2: Registry
+        tab_reg = QtWidgets.QWidget()
+        tr_layout = QtWidgets.QVBoxLayout(tab_reg)
+        tr_layout.setContentsMargins(6, 8, 6, 6)
+
+        txt_reg = QtWidgets.QPlainTextEdit()
+        txt_reg.setReadOnly(True)
+        if reg_lines:
+            txt_reg.setPlainText("\n".join(reg_lines))
+        else:
+            txt_reg.setPlainText("; No se registraron claves de registro personalizadas para este plugin.\n; (Las claves genéricas del fabricante se exportan automáticamente al generar .vstpack).")
+
+        tr_layout.addWidget(txt_reg)
+
+        reg_actions = QtWidgets.QHBoxLayout()
+        lbl_reg_count = QtWidgets.QLabel(f"Total: {len(reg_lines)} línea(s) de registro capturadas.")
+        lbl_reg_count.setObjectName("SecondaryAccentLabel")
+        reg_actions.addWidget(lbl_reg_count)
+        reg_actions.addStretch()
+
+        btn_copy_reg = QtWidgets.QPushButton("Copiar Registro")
+        btn_copy_reg.setIcon(get_system_icon("edit-copy", "📋"))
+        btn_copy_reg.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(txt_reg.toPlainText()), QtWidgets.QMessageBox.information(self, "Copiado", "Contenido del registro copiado al portapapeles.")))
+        reg_actions.addWidget(btn_copy_reg)
+        tr_layout.addLayout(reg_actions)
+
+        tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), f"Registro ({len(reg_lines)})")
+
+        # Tab 3: Receipts / History
+        tab_hist = QtWidgets.QWidget()
+        th_layout = QtWidgets.QVBoxLayout(tab_hist)
+        th_layout.setContentsMargins(6, 8, 6, 6)
+
+        table_hist = QtWidgets.QTableWidget()
+        table_hist.setColumnCount(5)
+        table_hist.setHorizontalHeaderLabels(["Recibo / Evento", "Tipo / Origen", "Fecha de Captura", "Archivos Registrados", "Líneas de Reg"])
+        table_hist.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table_hist.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_hist.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_hist.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_hist.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_hist.setAlternatingRowColors(True)
+
+        table_hist.setRowCount(len(receipts))
+        for r_idx, rc in enumerate(receipts):
+            r_data = rc["data"]
+            table_hist.setItem(r_idx, 0, QtWidgets.QTableWidgetItem(rc["filename"]))
+            table_hist.setItem(r_idx, 1, QtWidgets.QTableWidgetItem(r_data.get("installer", "Desconocido")))
+            table_hist.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(r_data.get("installed_at", "N/A")))
+            table_hist.setItem(r_idx, 3, QtWidgets.QTableWidgetItem(str(len(r_data.get("new_files", [])))))
+            table_hist.setItem(r_idx, 4, QtWidgets.QTableWidgetItem(str(r_data.get("reg_lines_count", len(r_data.get("reg_diff", []))))))
+
+        th_layout.addWidget(table_hist)
+        tabs.addTab(tab_hist, get_system_icon("history", "📜"), f"Historial ADN ({len(receipts)})")
+
+        layout.addWidget(tabs)
+
+        # Footer actions
+        bottom_h = QtWidgets.QHBoxLayout()
+        btn_export = QtWidgets.QPushButton("Exportar a .vstpack")
+        btn_export.setIcon(get_system_icon("document-save", "📦"))
+        btn_export.clicked.connect(self.export_from_dialog)
+
+        btn_close = QtWidgets.QPushButton("Cerrar")
+        btn_close.clicked.connect(self.accept)
+
+        bottom_h.addStretch()
+        bottom_h.addWidget(btn_export)
+        bottom_h.addWidget(btn_close)
+        layout.addLayout(bottom_h)
+
+    def export_from_dialog(self):
+        if self.parent() and hasattr(self.parent(), "export_selected_product"):
+            self.accept()
+            self.parent().export_selected_product()
+
+    def init_from_vstpack(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        data = inspect_vstpack_data(self.vstpack_path)
+        manifest = data["manifest"]
+        files = data["files"]
+        reg_content = data["reg_content"]
+        prods = manifest.get("products", [])
+
+        # Header card
+        header_card = QtWidgets.QFrame()
+        header_card.setObjectName("HeaderFrame")
+        h_layout = QtWidgets.QHBoxLayout(header_card)
+        h_layout.setContentsMargins(14, 12, 14, 12)
+
+        v_title = QtWidgets.QVBoxLayout()
+        pkg_name = os.path.basename(self.vstpack_path)
+        lbl_name = QtWidgets.QLabel(f"<h2>Paquete: {pkg_name}</h2>")
+        lbl_name.setTextFormat(QtCore.Qt.TextFormat.RichText)
+
+        prods_names = ", ".join([p.get("name", "Plugin") for p in prods]) if prods else "Plugins VST"
+        created_at = manifest.get("created_at", "N/A")
+        total_sz = format_file_size(data["total_size"])
+        pkg_sz = format_file_size(os.path.getsize(self.vstpack_path)) if os.path.exists(self.vstpack_path) else "N/A"
+
+        meta_lbl = QtWidgets.QLabel(
+            f"<b>Contenido:</b> {prods_names}  |  "
+            f"<b>Tamaño Comprimido:</b> {pkg_sz}  |  "
+            f"<b>Descomprimido:</b> {total_sz}  |  "
+            f"<b>Creado:</b> {created_at}"
+        )
+        meta_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v_title.addWidget(lbl_name)
+        v_title.addWidget(meta_lbl)
+        h_layout.addLayout(v_title)
+        h_layout.addStretch()
+
+        layout.addWidget(header_card)
+
+        # Tab Widget
+        tabs = QtWidgets.QTabWidget()
+
+        # Tab 1: Files
+        tab_files = QtWidgets.QWidget()
+        tf_layout = QtWidgets.QVBoxLayout(tab_files)
+        tf_layout.setContentsMargins(6, 8, 6, 6)
+
+        search_h = QtWidgets.QHBoxLayout()
+        txt_search = QtWidgets.QLineEdit()
+        txt_search.setPlaceholderText("🔍 Filtrar archivos o presets dentro del paquete...")
+        txt_search.setClearButtonEnabled(True)
+        search_h.addWidget(txt_search)
+        tf_layout.addLayout(search_h)
+
+        table_files = QtWidgets.QTableWidget()
+        table_files.setColumnCount(3)
+        table_files.setHorizontalHeaderLabels(["Ruta de Destino en Paquete", "Tamaño Descomprimido", "Tamaño Comprimido"])
+        table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.setAlternatingRowColors(True)
+
+        table_files.setRowCount(len(files))
+        for r_idx, f_info in enumerate(files):
+            item_p = QtWidgets.QTableWidgetItem(f_info["path"])
+            item_sz = QtWidgets.QTableWidgetItem(format_file_size(f_info["size"]))
+            item_sz.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            item_csz = QtWidgets.QTableWidgetItem(format_file_size(f_info["compressed_size"]))
+            item_csz.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+            table_files.setItem(r_idx, 0, item_p)
+            table_files.setItem(r_idx, 1, item_sz)
+            table_files.setItem(r_idx, 2, item_csz)
+
+        def filter_pkg_files(text):
+            query = text.lower()
+            for row in range(table_files.rowCount()):
+                it = table_files.item(row, 0)
+                table_files.setRowHidden(row, not (it and query in it.text().lower()))
+
+        txt_search.textChanged.connect(filter_pkg_files)
+        tf_layout.addWidget(table_files)
+        tabs.addTab(tab_files, get_system_icon("folder", "📁"), f"Archivos a Instalar ({len(files)})")
+
+        # Tab 2: Registry
+        tab_reg = QtWidgets.QWidget()
+        tr_layout = QtWidgets.QVBoxLayout(tab_reg)
+        tr_layout.setContentsMargins(6, 8, 6, 6)
+
+        txt_reg = QtWidgets.QPlainTextEdit()
+        txt_reg.setReadOnly(True)
+        txt_reg.setPlainText(reg_content if reg_content else "; No hay entradas de registro en este paquete.")
+        tr_layout.addWidget(txt_reg)
+        tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), "Registro a Fusionar")
+
+        # Tab 3: Manifest JSON
+        tab_man = QtWidgets.QWidget()
+        tm_layout = QtWidgets.QVBoxLayout(tab_man)
+        tm_layout.setContentsMargins(6, 8, 6, 6)
+
+        txt_man = QtWidgets.QPlainTextEdit()
+        txt_man.setReadOnly(True)
+        txt_man.setPlainText(json.dumps(manifest, indent=2))
+        tm_layout.addWidget(txt_man)
+        tabs.addTab(tab_man, get_system_icon("text-x-generic", "📄"), "Manifiesto JSON")
+
+        layout.addWidget(tabs)
+
+        # Footer
+        bottom_h = QtWidgets.QHBoxLayout()
+        btn_install = QtWidgets.QPushButton("Instalar este Paquete")
+        btn_install.setIcon(get_system_icon("system-software-install", "📥"))
+        btn_install.clicked.connect(self.install_from_dialog)
+
+        btn_close = QtWidgets.QPushButton("Cerrar")
+        btn_close.clicked.connect(self.accept)
+
+        bottom_h.addStretch()
+        bottom_h.addWidget(btn_install)
+        bottom_h.addWidget(btn_close)
+        layout.addLayout(bottom_h)
+
+    def install_from_dialog(self):
+        if self.parent() and hasattr(self.parent(), "add_files"):
+            self.accept()
+            self.parent().add_files([self.vstpack_path])
+            self.parent().tabs.setCurrentIndex(1)
+
+
+class ManualCaptureReviewDialog(QtWidgets.QDialog):
+    """Displays exact files and registry lines captured during manual capture mode and allows assigning to a plugin."""
+    def __init__(self, parent=None, diff=None, products=None, wine_prefix=""):
+        super().__init__(parent)
+        self.diff = diff or {"new_files": [], "new_reg_lines": []}
+        self.products = products or []
+        self.wine_prefix = wine_prefix
+        self.selected_target = None
+        self.setMinimumSize(850, 580)
+        self.resize(920, 640)
+        self.setWindowTitle("Revisión de Cambios Capturados - Asignación de ADN")
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        num_files = len(self.diff.get("new_files", []))
+        num_regs = len(self.diff.get("new_reg_lines", []))
+
+        # Header card
+        header_card = QtWidgets.QFrame()
+        header_card.setObjectName("HeaderFrame")
+        h_layout = QtWidgets.QHBoxLayout(header_card)
+        h_layout.setContentsMargins(14, 12, 14, 12)
+
+        v_title = QtWidgets.QVBoxLayout()
+        lbl_title = QtWidgets.QLabel("<h2>🔴 Captura Manual Finalizada con Éxito</h2>")
+        lbl_title.setTextFormat(QtCore.Qt.TextFormat.RichText)
+
+        meta_lbl = QtWidgets.QLabel(
+            f"Se atraparon <b>{num_files} archivo(s) nuevos/modificados</b> y <b>{num_regs} línea(s) de registro</b> en Wine.<br>"
+            "Revisa los cambios detectados abajo y selecciona a qué plugin deseas inyectarlos en su ADN."
+        )
+        meta_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        v_title.addWidget(lbl_title)
+        v_title.addWidget(meta_lbl)
+        h_layout.addLayout(v_title)
+        h_layout.addStretch()
+
+        layout.addWidget(header_card)
+
+        # Tabs
+        tabs = QtWidgets.QTabWidget()
+
+        # Tab 1: Files
+        tab_files = QtWidgets.QWidget()
+        tf_layout = QtWidgets.QVBoxLayout(tab_files)
+        tf_layout.setContentsMargins(6, 8, 6, 6)
+
+        search_h = QtWidgets.QHBoxLayout()
+        txt_search = QtWidgets.QLineEdit()
+        txt_search.setPlaceholderText("🔍 Filtrar archivos capturados...")
+        txt_search.setClearButtonEnabled(True)
+        search_h.addWidget(txt_search)
+        tf_layout.addLayout(search_h)
+
+        table_files = QtWidgets.QTableWidget()
+        table_files.setColumnCount(3)
+        table_files.setHorizontalHeaderLabels(["Ruta del Archivo Capturado", "Ubicación / Tipo", "Tamaño"])
+        table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        table_files.setAlternatingRowColors(True)
+
+        raw_files = self.diff.get("new_files", [])
+        table_files.setRowCount(len(raw_files))
+        for r_idx, fp in enumerate(raw_files):
+            norm = fp.replace("\\", "/").lower()
+            if "/documents/" in norm or "/documentos/" in norm:
+                cat = "Presets / Librería (Documentos)"
+            elif "/appdata/" in norm:
+                cat = "Configuración / Licencia (AppData)"
+            elif "/program files/" in norm or "/common files/" in norm:
+                cat = "Binario de Plugin / Soporte"
+            elif "/programdata/" in norm:
+                cat = "Datos Compartidos (ProgramData)"
+            else:
+                cat = "Otro Archivo Modificado"
+
+            try:
+                sz = format_file_size(os.path.getsize(fp)) if os.path.exists(fp) and not os.path.isdir(fp) else "N/A"
+            except Exception:
+                sz = "N/A"
+
+            it_p = QtWidgets.QTableWidgetItem(fp)
+            it_c = QtWidgets.QTableWidgetItem(cat)
+            it_s = QtWidgets.QTableWidgetItem(sz)
+            it_s.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+
+            table_files.setItem(r_idx, 0, it_p)
+            table_files.setItem(r_idx, 1, it_c)
+            table_files.setItem(r_idx, 2, it_s)
+
+        def filter_captured_files(text):
+            query = text.lower()
+            for row in range(table_files.rowCount()):
+                it = table_files.item(row, 0)
+                table_files.setRowHidden(row, not (it and query in it.text().lower()))
+
+        txt_search.textChanged.connect(filter_captured_files)
+        tf_layout.addWidget(table_files)
+
+        # File actions
+        f_actions = QtWidgets.QHBoxLayout()
+        lbl_cnt = QtWidgets.QLabel(f"Total: {len(raw_files)} archivo(s) capturados.")
+        lbl_cnt.setObjectName("SecondaryAccentLabel")
+        f_actions.addWidget(lbl_cnt)
+        f_actions.addStretch()
+
+        btn_open = QtWidgets.QPushButton("Abrir Carpeta")
+        btn_open.setIcon(get_system_icon("folder-open", "📂"))
+        def open_cap_folder():
+            rows = table_files.selectionModel().selectedRows()
+            if rows:
+                p = table_files.item(rows[0].row(), 0).text()
+                target = p if os.path.isdir(p) else os.path.dirname(p)
+                if os.path.exists(target):
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+        btn_open.clicked.connect(open_cap_folder)
+
+        btn_copy = QtWidgets.QPushButton("Copiar Rutas")
+        btn_copy.setIcon(get_system_icon("edit-copy", "📋"))
+        btn_copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText("\n".join(raw_files)), QtWidgets.QMessageBox.information(self, "Copiado", f"Se copiaron {len(raw_files)} rutas al portapapeles.")))
+
+        f_actions.addWidget(btn_open)
+        f_actions.addWidget(btn_copy)
+        tf_layout.addLayout(f_actions)
+
+        tabs.addTab(tab_files, get_system_icon("folder", "📁"), f"Archivos ({len(raw_files)})")
+
+        # Tab 2: Registry
+        tab_reg = QtWidgets.QWidget()
+        tr_layout = QtWidgets.QVBoxLayout(tab_reg)
+        tr_layout.setContentsMargins(6, 8, 6, 6)
+
+        txt_reg = QtWidgets.QPlainTextEdit()
+        txt_reg.setReadOnly(True)
+        reg_lines = self.diff.get("new_reg_lines", [])
+        if reg_lines:
+            txt_reg.setPlainText("\n".join(reg_lines))
+        else:
+            txt_reg.setPlainText("; No se generaron modificaciones en el registro durante esta sesión de captura.")
+
+        tr_layout.addWidget(txt_reg)
+
+        r_actions = QtWidgets.QHBoxLayout()
+        lbl_rcnt = QtWidgets.QLabel(f"Total: {len(reg_lines)} línea(s) de registro capturadas.")
+        lbl_rcnt.setObjectName("SecondaryAccentLabel")
+        r_actions.addWidget(lbl_rcnt)
+        r_actions.addStretch()
+
+        btn_copy_r = QtWidgets.QPushButton("Copiar Registro")
+        btn_copy_r.setIcon(get_system_icon("edit-copy", "📋"))
+        btn_copy_r.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(txt_reg.toPlainText()), QtWidgets.QMessageBox.information(self, "Copiado", "Registro copiado al portapapeles.")))
+        r_actions.addWidget(btn_copy_r)
+        tr_layout.addLayout(r_actions)
+
+        tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), f"Registro ({len(reg_lines)})")
+
+        layout.addWidget(tabs)
+
+        # Assignment card
+        assign_card = QtWidgets.QFrame()
+        assign_card.setObjectName("CardFrame")
+        a_layout = QtWidgets.QHBoxLayout(assign_card)
+        a_layout.setContentsMargins(12, 10, 12, 10)
+
+        lbl_assign = QtWidgets.QLabel("<b>Vincular cambios al plugin:</b>")
+        self.cmb_target = QtWidgets.QComboBox()
+        self.cmb_target.setEditable(True)
+        self.cmb_target.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+
+        for p in self.products:
+            self.cmb_target.addItem(p.get("name", "Plugin"))
+
+        a_layout.addWidget(lbl_assign)
+        a_layout.addWidget(self.cmb_target)
+        layout.addWidget(assign_card)
+
+        # Footer buttons
+        bottom_h = QtWidgets.QHBoxLayout()
+        btn_save = QtWidgets.QPushButton("✓ Asignar e Inyectar en ADN del Plugin")
+        btn_save.setIcon(get_system_icon("dialog-ok-apply", "✓"))
+        btn_save.setFixedHeight(34)
+        btn_save.clicked.connect(self.on_accept_assignment)
+
+        btn_cancel = QtWidgets.QPushButton("Descartar Captura")
+        btn_cancel.setIcon(get_system_icon("dialog-cancel", "❌"))
+        btn_cancel.setFixedHeight(34)
+        btn_cancel.clicked.connect(self.reject)
+
+        bottom_h.addStretch()
+        bottom_h.addWidget(btn_save)
+        bottom_h.addWidget(btn_cancel)
+        layout.addLayout(bottom_h)
+
+    def on_accept_assignment(self):
+        target = self.cmb_target.currentText().strip()
+        if not target:
+            QtWidgets.QMessageBox.warning(self, "Nombre Requerido", "Por favor ingresa o selecciona el nombre del plugin al que deseas asignar estos cambios.")
+            return
+        self.selected_target = target
+        self.accept()
+
+
 class DropArea(QtWidgets.QFrame):
     files_dropped = QtCore.pyqtSignal(list)
 
@@ -1424,11 +2181,19 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.prod_table.horizontalHeader().setSectionResizeMode(6, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.prod_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.prod_table.setAlternatingRowColors(True)
+        self.prod_table.cellDoubleClicked.connect(lambda row, col: self.view_selected_product_details())
+        self.prod_table.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.prod_table.customContextMenuRequested.connect(self.show_prod_context_menu)
         layout.addWidget(self.prod_table)
 
         # Bottom Actions Bar
         bottom_bar = QtWidgets.QHBoxLayout()
         self.lbl_prod_count = QtWidgets.QLabel("0 plugins detectados.")
+
+        self.btn_view_details = QtWidgets.QPushButton("🔍 Ver Archivos / Historial")
+        self.btn_view_details.setToolTip("Inspecciona todos los archivos, presets, carpetas en Documentos, registro y recibos del plugin seleccionado.")
+        self.btn_view_details.setIcon(get_system_icon("document-properties", "🔍"))
+        self.btn_view_details.clicked.connect(self.view_selected_product_details)
 
         self.btn_install_pack = QtWidgets.QPushButton("📦 Instalar Pack (.vstpack)")
         self.btn_install_pack.setToolTip("Seleccionar e instalar uno o varios paquetes .vstpack en el entorno actual.")
@@ -1453,6 +2218,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         bottom_bar.addWidget(self.lbl_prod_count)
         bottom_bar.addSpacing(10)
+        bottom_bar.addWidget(self.btn_view_details)
         bottom_bar.addWidget(self.btn_install_pack)
         bottom_bar.addWidget(self.btn_start_capture)
         bottom_bar.addWidget(self.btn_stop_capture)
@@ -1609,6 +2375,26 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         imp_v.addWidget(btn_restore)
         cards_h.addWidget(card_import)
 
+        # Card 3: Inspect
+        card_inspect = QtWidgets.QFrame()
+        card_inspect.setObjectName("CardFrame")
+        ins_v = QtWidgets.QVBoxLayout(card_inspect)
+
+        ins_title = QtWidgets.QLabel("<b>3. Inspeccionar Paquete</b>")
+        ins_desc = QtWidgets.QLabel("Examina el contenido interno de cualquier <code>.vstpack</code>: consulta su manifiesto, binarios, presets y claves de registro sin instalarlo.")
+        ins_desc.setWordWrap(True)
+
+        btn_inspect = QtWidgets.QPushButton("Inspeccionar Archivo .vstpack")
+        btn_inspect.setIcon(get_system_icon("document-properties", "🔍"))
+        btn_inspect.setFixedHeight(36)
+        btn_inspect.clicked.connect(self.inspect_vstpack_file_action)
+
+        ins_v.addWidget(ins_title)
+        ins_v.addWidget(ins_desc)
+        ins_v.addStretch()
+        ins_v.addWidget(btn_inspect)
+        cards_h.addWidget(card_inspect)
+
         layout.addLayout(cards_h)
 
         self.export_status_lbl = QtWidgets.QLabel("")
@@ -1619,6 +2405,70 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
     # ----------------------------------------------------
     # SCANNING & PRODUCT AGGREGATION
     # ----------------------------------------------------
+
+    def view_selected_product_details(self):
+        row = self.prod_table.currentRow()
+        if row < 0 or row >= len(self.installed_products):
+            QtWidgets.QMessageBox.information(self, "Seleccionar Plugin", "Por favor selecciona un plugin de la tabla para ver sus detalles y ADN.")
+            return
+
+        p = self.installed_products[row]
+        dlg = ProductDetailsDialog(
+            parent=self,
+            product=p,
+            wine_prefix=self.wine_prefix,
+            wine_root=self.wine_root,
+            is_windows=self.is_windows
+        )
+        dlg.exec()
+
+    def inspect_vstpack_file_action(self):
+        vstpack_file, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Seleccionar Paquete VSTPack para Inspeccionar",
+            os.path.expanduser("~"),
+            "Paquetes VSTPack (*.vstpack *.zip);;Todos los archivos (*)"
+        )
+        if vstpack_file and os.path.isfile(vstpack_file):
+            dlg = ProductDetailsDialog(
+                parent=self,
+                vstpack_path=vstpack_file,
+                wine_prefix=self.wine_prefix,
+                wine_root=self.wine_root,
+                is_windows=self.is_windows
+            )
+            dlg.exec()
+
+    def show_prod_context_menu(self, pos):
+        item = self.prod_table.itemAt(pos)
+        if not item:
+            return
+        row = item.row()
+        self.prod_table.selectRow(row)
+        if row < 0 or row >= len(self.installed_products):
+            return
+        p = self.installed_products[row]
+
+        menu = QtWidgets.QMenu(self)
+        act_details = menu.addAction(get_system_icon("document-properties", "🔍"), "Ver Detalles / Archivos Instalados")
+        act_export = menu.addAction(get_system_icon("document-save", "📦"), f"Exportar '{p['name']}' a .vstpack")
+        menu.addSeparator()
+        act_folder = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
+        act_delete = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Eliminar Plugin...")
+
+        action = menu.exec(self.prod_table.viewport().mapToGlobal(pos))
+        if action == act_details:
+            self.view_selected_product_details()
+        elif action == act_export:
+            self.export_selected_product()
+        elif action == act_folder:
+            if p.get("files"):
+                f = p["files"][0]
+                target = f if os.path.isdir(f) else os.path.dirname(f)
+                if os.path.exists(target):
+                    self.open_folder_in_fm(target)
+        elif action == act_delete:
+            self.delete_selected_product()
 
     def start_manual_capture(self):
         QtWidgets.QMessageBox.information(self, "Captura Manual", "Se tomará una instantánea del estado actual del sistema (Registro y Archivos).\n\nLuego abre tu plugin, introduce tu licencia o aplica tu crack, y al terminar presiona 'Finalizar y Asignar Captura'.")
@@ -1658,38 +2508,37 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             self.refresh_installed_ecosystem()
             return
 
-        products_names = [p["name"] for p in self.installed_products]
-        if not products_names:
-            QtWidgets.QMessageBox.warning(self, "Error", "No hay plugins detectados a los cuales asignar estos cambios.")
-            self.refresh_installed_ecosystem()
-            return
-
-        item, ok = QtWidgets.QInputDialog.getItem(
-            self, 
-            "Asignar Captura", 
-            f"Se atraparon {num_files} archivos modificados y {num_regs} líneas de registro.\n\nSelecciona a qué plugin pertenecen para adjuntarlos:", 
-            products_names, 
-            0, 
-            False
+        review_dlg = ManualCaptureReviewDialog(
+            parent=self,
+            diff=diff,
+            products=self.installed_products,
+            wine_prefix=self.wine_prefix
         )
 
-        if ok and item:
-            tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
-            os.makedirs(tracker_dir, exist_ok=True)
-            stem = re.sub(r'[^a-zA-Z0-9_]', '_', item)
-            receipt_path = os.path.join(tracker_dir, f"{stem}_manual_patch_{int(time.time())}.json")
-            receipt_data = {
-                "installer": "Manual Patch/Crack/License",
-                "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "new_files": diff["new_files"],
-                "reg_lines_count": num_regs,
-                "reg_diff": diff["new_reg_lines"]
-            }
-            with open(receipt_path, "w", encoding="utf-8") as rpf:
-                json.dump(receipt_data, rpf, indent=2)
-            
-            QtWidgets.QMessageBox.information(self, "¡Atrapados!", f"Los cambios manuales fueron inyectados en el ADN de '{item}'.\n\nAl exportar a .vstpack, tu parche/licencia irá incluido automáticamente.")
-            
+        if review_dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            item = review_dlg.selected_target
+            if item:
+                tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+                os.makedirs(tracker_dir, exist_ok=True)
+                stem = re.sub(r'[^a-zA-Z0-9_]', '_', item)
+                receipt_path = os.path.join(tracker_dir, f"{stem}_manual_patch_{int(time.time())}.json")
+                receipt_data = {
+                    "installer": "Manual Patch/Crack/License",
+                    "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "new_files": diff["new_files"],
+                    "reg_lines_count": num_regs,
+                    "reg_diff": diff["new_reg_lines"]
+                }
+                with open(receipt_path, "w", encoding="utf-8") as rpf:
+                    json.dump(receipt_data, rpf, indent=2)
+
+                QtWidgets.QMessageBox.information(
+                    self, 
+                    "¡ADN Inyectado con Éxito!", 
+                    f"Los {num_files} archivo(s) y {num_regs} línea(s) de registro fueron inyectados en el ADN de '{item}'.\n\n"
+                    "Al exportar a .vstpack, tus parches, librerías y licencias irán incluidos automáticamente."
+                )
+
         self.refresh_installed_ecosystem()
 
     def browse_prefix_action(self):
