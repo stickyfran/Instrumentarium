@@ -3333,6 +3333,16 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
         self.installed_products = []
         for k, v in sorted(products.items()):
             v["formats"] = sorted(list(v["formats"]))
+            try:
+                det_info = get_product_detailed_info(v, self.wine_prefix)
+                v["size"] = det_info["total_size"]
+                v["total_files_count"] = len(det_info["files"])
+                v["receipts_count"] = len(det_info["receipts"])
+                v["is_tracked"] = det_info["is_tracked"]
+            except Exception:
+                v["total_files_count"] = len(v.get("files", []))
+                v["receipts_count"] = 0
+                v["is_tracked"] = is_product_tracked(v, self.wine_prefix)
             self.installed_products.append(v)
 
         self.render_products_table(self.installed_products)
@@ -3357,12 +3367,16 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             fmt_item = QtWidgets.QTableWidgetItem(fmt_str)
             fmt_item.setFont(QtGui.QFont(self.font().family(), 9, QtGui.QFont.Weight.Bold))
 
-            tracked = is_product_tracked(p, self.wine_prefix)
+            tracked = p.get("is_tracked", is_product_tracked(p, self.wine_prefix))
+            rc_cnt = p.get("receipts_count", 0)
+            tf_cnt = p.get("total_files_count", len(p.get("files", [])))
+
             if tracked:
-                track_item = QtWidgets.QTableWidgetItem("✓ Rastreado (Listo)")
+                track_text = f"✓ Rastreado ({rc_cnt} ADN)" if rc_cnt else "✓ Rastreado (Listo)"
+                track_item = QtWidgets.QTableWidgetItem(track_text)
                 track_item.setForeground(QtGui.QColor("#16a34a"))
                 track_item.setFont(QtGui.QFont(self.font().family(), 9, QtGui.QFont.Weight.Bold))
-                track_item.setToolTip("Instalación registrada por Instrumentarium. Dispone de claves de Windows y datos para .vstpack.")
+                track_item.setToolTip(f"Instalación registrada por Instrumentarium.\n• {rc_cnt} sesión(es) de captura / recibo(s)\n• {tf_cnt:,} archivos asociados (binarios, presets, AppData)")
             else:
                 track_item = QtWidgets.QTableWidgetItem("⚠️ No Rastreado")
                 track_item.setForeground(QtGui.QColor("#eab308"))
@@ -3381,7 +3395,10 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 self.prod_table.setItem(row, 4, QtWidgets.QTableWidgetItem("-"))
 
             ver_item = QtWidgets.QTableWidgetItem(p["version"])
-            size_item = QtWidgets.QTableWidgetItem(human_readable_size(p["size"]))
+            size_str = format_file_size(p["size"])
+            size_item = QtWidgets.QTableWidgetItem(size_str)
+            size_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+            size_item.setToolTip(f"Tamaño total del ecosistema: {size_str}\nIncluye binarios VST, librerías/presets en Documentos y datos en AppData ({tf_cnt:,} archivos en total).")
 
             self.prod_table.setItem(row, 0, name_item)
             self.prod_table.setItem(row, 1, vendor_item)
@@ -3390,7 +3407,8 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
             self.prod_table.setItem(row, 5, ver_item)
             self.prod_table.setItem(row, 6, size_item)
 
-        self.lbl_prod_count.setText(f"{len(product_list)} productos ({sum(len(p['files']) for p in product_list)} formatos/archivos) detectados.")
+        total_files_all = sum(p.get('total_files_count', len(p.get('files', []))) for p in product_list)
+        self.lbl_prod_count.setText(f"{len(product_list)} plugin(s) detectados ({total_files_all:,} archivos registrados en el ecosistema).")
 
     def filter_products_table(self, query):
         query = query.lower().strip()
