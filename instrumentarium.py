@@ -1432,8 +1432,12 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         self.wine_prefix = wine_prefix
         self.wine_root = wine_root
         self.is_windows = is_windows
-        self.setMinimumSize(880, 620)
-        self.resize(960, 680)
+        self.setMinimumSize(900, 640)
+        self.resize(980, 700)
+
+        self.main_layout = QtWidgets.QVBoxLayout(self)
+        self.main_layout.setContentsMargins(14, 14, 14, 14)
+        self.main_layout.setSpacing(10)
 
         if self.vstpack_path:
             self.setWindowTitle(f"Inspección de Paquete: {os.path.basename(self.vstpack_path)}")
@@ -1443,11 +1447,117 @@ class ProductDetailsDialog(QtWidgets.QDialog):
             self.setWindowTitle(f"Detalles y ADN del Plugin: {p_name}")
             self.init_from_product()
 
-    def init_from_product(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
+    def clear_layout(self):
+        while self.main_layout.count():
+            item = self.main_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
 
+    def refresh_from_product(self):
+        self.clear_layout()
+        self.init_from_product()
+        if self.parent() and hasattr(self.parent(), "refresh_installed_ecosystem"):
+            self.parent().refresh_installed_ecosystem()
+
+    def remove_file_from_dna(self, file_path):
+        if not file_path:
+            return
+        p_name = self.product.get("name", "Plugin") if self.product else "Plugin"
+        fname = os.path.basename(file_path)
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Desvincular Archivo del ADN",
+            f"¿Deseas desvincular el archivo:\n\n{file_path}\n\ndel ADN de '{p_name}'?\n\n"
+            "Nota: El archivo físico se conservará intacto en tu disco. Solo se quitará del tracking y de futuras exportaciones a .vstpack.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+        modified_count = 0
+        if os.path.isdir(tracker_dir):
+            for rf in os.listdir(tracker_dir):
+                if rf.endswith(".json"):
+                    rpath = os.path.join(tracker_dir, rf)
+                    try:
+                        with open(rpath, "r", encoding="utf-8") as rf_fd:
+                            rdata = json.load(rf_fd)
+                        if file_path in rdata.get("new_files", []):
+                            rdata["new_files"].remove(file_path)
+                            with open(rpath, "w", encoding="utf-8") as rf_fd:
+                                json.dump(rdata, rf_fd, indent=2)
+                            modified_count += 1
+                    except Exception:
+                        pass
+
+        QtWidgets.QMessageBox.information(self, "Archivo Desvinculado", f"El archivo '{fname}' fue desvinculado del ADN en {modified_count} recibo(s).")
+        self.refresh_from_product()
+
+    def remove_receipt_from_dna(self, receipt_filename):
+        if not receipt_filename:
+            return
+        p_name = self.product.get("name", "Plugin") if self.product else "Plugin"
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Eliminar Recibo de ADN",
+            f"¿Estás seguro de eliminar el recibo histórico '{receipt_filename}' del ADN de '{p_name}'?\n\n"
+            "Se desvincularán todos los archivos y entradas de registro capturadas en esta sesión.\n\n"
+            "(Los archivos físicos en disco NO se borrarán).",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        rpath = os.path.join(self.wine_prefix, ".vst_tracker", receipt_filename)
+        if os.path.isfile(rpath):
+            try:
+                os.remove(rpath)
+                QtWidgets.QMessageBox.information(self, "Recibo Eliminado", f"El recibo '{receipt_filename}' fue eliminado con éxito del ADN.")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error al Eliminar", f"No se pudo eliminar el recibo:\n{e}")
+        self.refresh_from_product()
+
+    def remove_reg_line_from_dna(self, reg_line):
+        if not reg_line:
+            return
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Desvincular Entrada de Registro",
+            f"¿Deseas desvincular la siguiente entrada de registro del ADN?\n\n{reg_line}\n\n(No se modificará el registro actual de Wine/Windows, solo el ADN guardado).",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+        modified_count = 0
+        if os.path.isdir(tracker_dir):
+            for rf in os.listdir(tracker_dir):
+                if rf.endswith(".json"):
+                    rpath = os.path.join(tracker_dir, rf)
+                    try:
+                        with open(rpath, "r", encoding="utf-8") as rf_fd:
+                            rdata = json.load(rf_fd)
+                        if reg_line in rdata.get("reg_diff", []):
+                            rdata["reg_diff"].remove(reg_line)
+                            rdata["reg_lines_count"] = len(rdata["reg_diff"])
+                            with open(rpath, "w", encoding="utf-8") as rf_fd:
+                                json.dump(rdata, rf_fd, indent=2)
+                            modified_count += 1
+                    except Exception:
+                        pass
+
+        QtWidgets.QMessageBox.information(self, "Registro Desvinculado", f"Se quitó la clave del ADN en {modified_count} recibo(s).")
+        self.refresh_from_product()
+
+    def init_from_product(self):
         data = get_product_detailed_info(self.product, self.wine_prefix)
         p = data["product"]
         files = data["files"]
@@ -1468,7 +1578,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         ver = p.get('version', '')
         fmt_str = " • ".join(p.get('formats', ['VST3']))
         total_sz = format_file_size(data["total_size"])
-        status_text = "✓ Rastreado (Listo para exportar)" if data["is_tracked"] else "⚠️ No Rastreado (Solo binario base)"
+        status_text = f"✓ Rastreado ({len(receipts)} recibos en ADN)" if data["is_tracked"] else "⚠️ No Rastreado (Solo binario base)"
         status_color = "#16a34a" if data["is_tracked"] else "#f59e0b"
 
         meta_lbl = QtWidgets.QLabel(
@@ -1484,7 +1594,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         h_layout.addLayout(v_title)
         h_layout.addStretch()
 
-        layout.addWidget(header_card)
+        self.main_layout.addWidget(header_card)
 
         # Tab Widget
         tabs = QtWidgets.QTabWidget()
@@ -1536,6 +1646,35 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                 table_files.setRowHidden(row, not match)
 
         txt_search.textChanged.connect(filter_files_list)
+
+        # Context menu for Table Files
+        table_files.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        def show_files_menu(pos):
+            item = table_files.itemAt(pos)
+            if not item:
+                return
+            row = item.row()
+            table_files.selectRow(row)
+            abs_fp = table_files.item(row, 3).text()
+
+            menu = QtWidgets.QMenu(self)
+            act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
+            act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
+            menu.addSeparator()
+            act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)")
+
+            action = menu.exec(table_files.viewport().mapToGlobal(pos))
+            if action == act_open:
+                target = abs_fp if os.path.isdir(abs_fp) else os.path.dirname(abs_fp)
+                if os.path.exists(target):
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+            elif action == act_copy:
+                QtWidgets.QApplication.clipboard().setText(abs_fp)
+                QtWidgets.QMessageBox.information(self, "Copiado", f"Ruta copiada al portapapeles:\n{abs_fp}")
+            elif action == act_unlink:
+                self.remove_file_from_dna(abs_fp)
+
+        table_files.customContextMenuRequested.connect(show_files_menu)
         tf_layout.addWidget(table_files)
 
         # File actions bar
@@ -1575,8 +1714,22 @@ class ProductDetailsDialog(QtWidgets.QDialog):
 
         btn_copy_paths.clicked.connect(copy_paths_action)
 
+        btn_unlink_file = QtWidgets.QPushButton("Quitar del ADN")
+        btn_unlink_file.setIcon(get_system_icon("edit-delete", "🗑️"))
+        btn_unlink_file.setToolTip("Quita el archivo seleccionado del ADN y de los paquetes .vstpack (sin borrar el archivo de disco).")
+        def unlink_selected_file():
+            rows = table_files.selectionModel().selectedRows()
+            if rows:
+                abs_path = table_files.item(rows[0].row(), 3).text()
+                self.remove_file_from_dna(abs_path)
+            else:
+                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un archivo de la tabla para desvincularlo del ADN.")
+
+        btn_unlink_file.clicked.connect(unlink_selected_file)
+
         f_actions.addWidget(btn_open_folder)
         f_actions.addWidget(btn_copy_paths)
+        f_actions.addWidget(btn_unlink_file)
         tf_layout.addLayout(f_actions)
         tabs.addTab(tab_files, get_system_icon("folder", "📁"), f"Archivos ({len(files)})")
 
@@ -1652,6 +1805,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
             root_item.setText(1, "Evento Registrado")
             root_item.setText(2, f"Fecha: {r_date}")
             root_item.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.Bold))
+            root_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "receipt", "filename": rf_name})
 
             # Child node 1: Files
             files_node = QtWidgets.QTreeWidgetItem(root_item)
@@ -1660,6 +1814,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
             files_node.setText(1, "Lista de Archivos")
             files_node.setText(2, f"{len(r_files)} archivos")
             files_node.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.DemiBold))
+            files_node.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "files_category", "filename": rf_name})
 
             for fp in r_files:
                 f_item = QtWidgets.QTreeWidgetItem(files_node)
@@ -1692,7 +1847,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                 f_item.setText(0, rel)
                 f_item.setText(1, cat)
                 f_item.setText(2, sz)
-                f_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, fp)
+                f_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "file", "path": fp, "filename": rf_name})
 
             # Child node 2: Registry
             if r_reg:
@@ -1702,6 +1857,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                 reg_node.setText(1, "Claves de Registro")
                 reg_node.setText(2, f"{len(r_reg)} líneas")
                 reg_node.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.DemiBold))
+                reg_node.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "reg_category", "filename": rf_name})
 
                 for r_line in r_reg:
                     rl_item = QtWidgets.QTreeWidgetItem(reg_node)
@@ -1709,6 +1865,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                     rl_item.setText(0, r_line.strip())
                     rl_item.setText(1, "Entrada de Registro")
                     rl_item.setText(2, "")
+                    rl_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, {"type": "reg_line", "line": r_line, "filename": rf_name})
 
         btn_expand_all.clicked.connect(tree_hist.expandAll)
         btn_collapse_all.clicked.connect(tree_hist.collapseAll)
@@ -1739,12 +1896,67 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         txt_hist_search.textChanged.connect(filter_hist_tree)
 
         def on_tree_double_clicked(item, col):
-            fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            if fp and os.path.exists(fp):
-                target = fp if os.path.isdir(fp) else os.path.dirname(fp)
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(meta, dict) and meta.get("type") == "file":
+                fp = meta.get("path")
+                if fp and os.path.exists(fp):
+                    target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
 
         tree_hist.itemDoubleClicked.connect(on_tree_double_clicked)
+
+        # Context menu for History Tree
+        tree_hist.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        def show_hist_tree_menu(pos):
+            item = tree_hist.itemAt(pos)
+            if not item:
+                return
+            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if not isinstance(meta, dict):
+                return
+
+            menu = QtWidgets.QMenu(self)
+            m_type = meta.get("type")
+
+            if m_type == "receipt":
+                rf_name = meta.get("filename")
+                act_del_rc = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Eliminar Recibo '{rf_name}' del ADN...")
+                menu.addSeparator()
+                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Nombre de Recibo")
+                action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                if action == act_del_rc:
+                    self.remove_receipt_from_dna(rf_name)
+                elif action == act_copy:
+                    QtWidgets.QApplication.clipboard().setText(rf_name)
+
+            elif m_type == "file":
+                fp = meta.get("path")
+                act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
+                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
+                menu.addSeparator()
+                act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)...")
+                action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                if action == act_open:
+                    target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                    if os.path.exists(target):
+                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+                elif action == act_copy:
+                    QtWidgets.QApplication.clipboard().setText(fp)
+                elif action == act_unlink:
+                    self.remove_file_from_dna(fp)
+
+            elif m_type == "reg_line":
+                r_line = meta.get("line")
+                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Entrada de Registro")
+                menu.addSeparator()
+                act_del_reg = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar esta Entrada de Registro del ADN...")
+                action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                if action == act_copy:
+                    QtWidgets.QApplication.clipboard().setText(r_line)
+                elif action == act_del_reg:
+                    self.remove_reg_line_from_dna(r_line)
+
+        tree_hist.customContextMenuRequested.connect(show_hist_tree_menu)
         th_layout.addWidget(tree_hist)
 
         # Bottom actions for Tab 3
@@ -1754,39 +1966,69 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         hist_actions.addWidget(lbl_hist_info)
         hist_actions.addStretch()
 
-        btn_open_hist_folder = QtWidgets.QPushButton("Abrir Carpeta de Archivo")
+        btn_open_hist_folder = QtWidgets.QPushButton("Abrir Carpeta")
         btn_open_hist_folder.setIcon(get_system_icon("folder-open", "📂"))
         def open_selected_hist_file():
             item = tree_hist.currentItem()
             if item:
-                fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-                if fp and os.path.exists(fp):
-                    target = fp if os.path.isdir(fp) else os.path.dirname(fp)
-                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
-                else:
-                    tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
-                    if os.path.exists(tracker_dir):
-                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(tracker_dir))
+                meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(meta, dict) and meta.get("type") == "file":
+                    fp = meta.get("path")
+                    if fp and os.path.exists(fp):
+                        target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+                        return
+            tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+            if os.path.exists(tracker_dir):
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(tracker_dir))
         btn_open_hist_folder.clicked.connect(open_selected_hist_file)
+
+        btn_unlink_hist_item = QtWidgets.QPushButton("Quitar del ADN")
+        btn_unlink_hist_item.setIcon(get_system_icon("edit-delete", "🗑️"))
+        btn_unlink_hist_item.setToolTip("Quita el elemento seleccionado (recibo completo, archivo o registro) del ADN del plugin.")
+        def unlink_selected_tree_item():
+            item = tree_hist.currentItem()
+            if not item:
+                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un recibo, archivo o línea de registro para desvincular.")
+                return
+            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(meta, dict):
+                m_type = meta.get("type")
+                if m_type == "receipt":
+                    self.remove_receipt_from_dna(meta.get("filename"))
+                elif m_type == "file":
+                    self.remove_file_from_dna(meta.get("path"))
+                elif m_type == "reg_line":
+                    self.remove_reg_line_from_dna(meta.get("line"))
+                else:
+                    QtWidgets.QMessageBox.information(self, "Selección", "Selecciona un recibo individual o archivo para quitar.")
+
+        btn_unlink_hist_item.clicked.connect(unlink_selected_tree_item)
 
         btn_copy_hist_item = QtWidgets.QPushButton("Copiar Texto / Rutas")
         btn_copy_hist_item.setIcon(get_system_icon("edit-copy", "📋"))
         def copy_selected_hist_text():
             item = tree_hist.currentItem()
             if item:
-                fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-                text_to_copy = fp if fp else item.text(0)
+                meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(meta, dict) and meta.get("type") == "file":
+                    text_to_copy = meta.get("path", "")
+                elif isinstance(meta, dict) and meta.get("type") == "reg_line":
+                    text_to_copy = meta.get("line", "")
+                else:
+                    text_to_copy = item.text(0)
                 QtWidgets.QApplication.clipboard().setText(text_to_copy)
                 QtWidgets.QMessageBox.information(self, "Copiado", f"Copiado al portapapeles:\n{text_to_copy}")
         btn_copy_hist_item.clicked.connect(copy_selected_hist_text)
 
         hist_actions.addWidget(btn_open_hist_folder)
         hist_actions.addWidget(btn_copy_hist_item)
+        hist_actions.addWidget(btn_unlink_hist_item)
         th_layout.addLayout(hist_actions)
 
         tabs.addTab(tab_hist, get_system_icon("history", "📜"), f"Historial ADN ({len(receipts)})")
 
-        layout.addWidget(tabs)
+        self.main_layout.addWidget(tabs)
 
         # Footer actions
         bottom_h = QtWidgets.QHBoxLayout()
@@ -1800,7 +2042,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         bottom_h.addStretch()
         bottom_h.addWidget(btn_export)
         bottom_h.addWidget(btn_close)
-        layout.addLayout(bottom_h)
+        self.main_layout.addLayout(bottom_h)
 
     def export_from_dialog(self):
         if self.parent() and hasattr(self.parent(), "export_selected_product"):
@@ -1808,10 +2050,6 @@ class ProductDetailsDialog(QtWidgets.QDialog):
             self.parent().export_selected_product()
 
     def init_from_vstpack(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
-
         data = inspect_vstpack_data(self.vstpack_path)
         manifest = data["manifest"]
         files = data["files"]
@@ -1846,7 +2084,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         h_layout.addLayout(v_title)
         h_layout.addStretch()
 
-        layout.addWidget(header_card)
+        self.main_layout.addWidget(header_card)
 
         # Tab Widget
         tabs = QtWidgets.QTabWidget()
@@ -1915,7 +2153,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         tm_layout.addWidget(txt_man)
         tabs.addTab(tab_man, get_system_icon("text-x-generic", "📄"), "Manifiesto JSON")
 
-        layout.addWidget(tabs)
+        self.main_layout.addWidget(tabs)
 
         # Footer
         bottom_h = QtWidgets.QHBoxLayout()
@@ -1929,7 +2167,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         bottom_h.addStretch()
         bottom_h.addWidget(btn_install)
         bottom_h.addWidget(btn_close)
-        layout.addLayout(bottom_h)
+        self.main_layout.addLayout(bottom_h)
 
     def install_from_dialog(self):
         if self.parent() and hasattr(self.parent(), "add_files"):
@@ -1939,16 +2177,17 @@ class ProductDetailsDialog(QtWidgets.QDialog):
 
 
 class ManualCaptureReviewDialog(QtWidgets.QDialog):
-    """Displays exact files and registry lines captured during manual capture mode and allows assigning to a plugin."""
+    """Displays exact files and registry lines captured during manual capture mode with checkbox selection."""
     def __init__(self, parent=None, diff=None, products=None, wine_prefix=""):
         super().__init__(parent)
         self.diff = diff or {"new_files": [], "new_reg_lines": []}
         self.products = products or []
         self.wine_prefix = wine_prefix
         self.selected_target = None
-        self.setMinimumSize(850, 580)
-        self.resize(920, 640)
-        self.setWindowTitle("Revisión de Cambios Capturados - Asignación de ADN")
+        self.filtered_diff = {"new_files": [], "new_reg_lines": []}
+        self.setMinimumSize(880, 620)
+        self.resize(960, 680)
+        self.setWindowTitle("Revisión y Selección de Cambios Capturados - ADN de Plugin")
         self.setup_ui()
 
     def setup_ui(self):
@@ -1966,12 +2205,12 @@ class ManualCaptureReviewDialog(QtWidgets.QDialog):
         h_layout.setContentsMargins(14, 12, 14, 12)
 
         v_title = QtWidgets.QVBoxLayout()
-        lbl_title = QtWidgets.QLabel("<h2>🔴 Captura Manual Finalizada con Éxito</h2>")
+        lbl_title = QtWidgets.QLabel("<h2>🔴 Revisión de Cambios Capturados</h2>")
         lbl_title.setTextFormat(QtCore.Qt.TextFormat.RichText)
 
         meta_lbl = QtWidgets.QLabel(
-            f"Se atraparon <b>{num_files} archivo(s) nuevos/modificados</b> y <b>{num_regs} línea(s) de registro</b> en Wine.<br>"
-            "Revisa los cambios detectados abajo y selecciona a qué plugin deseas inyectarlos en su ADN."
+            f"Se atraparon <b>{num_files} archivo(s) nuevos/modificados</b> y <b>{num_regs} línea(s) de registro</b>.<br>"
+            "<b>Marca o desmarca</b> los elementos que deseas incluir en el ADN del plugin antes de guardar."
         )
         meta_lbl.setTextFormat(QtCore.Qt.TextFormat.RichText)
         v_title.addWidget(lbl_title)
@@ -1984,28 +2223,37 @@ class ManualCaptureReviewDialog(QtWidgets.QDialog):
         # Tabs
         tabs = QtWidgets.QTabWidget()
 
-        # Tab 1: Files
+        # Tab 1: Files with Checkboxes
         tab_files = QtWidgets.QWidget()
         tf_layout = QtWidgets.QVBoxLayout(tab_files)
         tf_layout.setContentsMargins(6, 8, 6, 6)
 
-        search_h = QtWidgets.QHBoxLayout()
+        # Search and batch selection bar
+        sel_bar = QtWidgets.QHBoxLayout()
         txt_search = QtWidgets.QLineEdit()
         txt_search.setPlaceholderText("🔍 Filtrar archivos capturados...")
         txt_search.setClearButtonEnabled(True)
-        search_h.addWidget(txt_search)
-        tf_layout.addLayout(search_h)
 
-        table_files = QtWidgets.QTableWidget()
-        table_files.setColumnCount(3)
-        table_files.setHorizontalHeaderLabels(["Ruta del Archivo Capturado", "Ubicación / Tipo", "Tamaño"])
-        table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_files.setAlternatingRowColors(True)
+        btn_select_all = QtWidgets.QPushButton("☑️ Marcar Todos")
+        btn_deselect_all = QtWidgets.QPushButton("⬜ Desmarcar Todos")
+        btn_invert = QtWidgets.QPushButton("🔄 Invertir")
+
+        sel_bar.addWidget(txt_search)
+        sel_bar.addWidget(btn_select_all)
+        sel_bar.addWidget(btn_deselect_all)
+        sel_bar.addWidget(btn_invert)
+        tf_layout.addLayout(sel_bar)
+
+        self.table_files = QtWidgets.QTableWidget()
+        self.table_files.setColumnCount(3)
+        self.table_files.setHorizontalHeaderLabels(["[☑] Ruta del Archivo Capturado", "Ubicación / Tipo", "Tamaño"])
+        self.table_files.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table_files.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table_files.setAlternatingRowColors(True)
 
         raw_files = self.diff.get("new_files", [])
-        table_files.setRowCount(len(raw_files))
+        self.table_files.setRowCount(len(raw_files))
         for r_idx, fp in enumerate(raw_files):
             norm = fp.replace("\\", "/").lower()
             if "/documents/" in norm or "/documentos/" in norm:
@@ -2025,36 +2273,71 @@ class ManualCaptureReviewDialog(QtWidgets.QDialog):
                 sz = "N/A"
 
             it_p = QtWidgets.QTableWidgetItem(fp)
+            it_p.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            it_p.setCheckState(QtCore.Qt.CheckState.Checked)
+            it_p.setData(QtCore.Qt.ItemDataRole.UserRole, fp)
+
             it_c = QtWidgets.QTableWidgetItem(cat)
             it_s = QtWidgets.QTableWidgetItem(sz)
             it_s.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
 
-            table_files.setItem(r_idx, 0, it_p)
-            table_files.setItem(r_idx, 1, it_c)
-            table_files.setItem(r_idx, 2, it_s)
+            self.table_files.setItem(r_idx, 0, it_p)
+            self.table_files.setItem(r_idx, 1, it_c)
+            self.table_files.setItem(r_idx, 2, it_s)
+
+        def set_all_files(state):
+            for row in range(self.table_files.rowCount()):
+                if not self.table_files.isRowHidden(row):
+                    it = self.table_files.item(row, 0)
+                    if it:
+                        it.setCheckState(state)
+            update_file_count_lbl()
+
+        def invert_files():
+            for row in range(self.table_files.rowCount()):
+                if not self.table_files.isRowHidden(row):
+                    it = self.table_files.item(row, 0)
+                    if it:
+                        new_state = QtCore.Qt.CheckState.Unchecked if it.checkState() == QtCore.Qt.CheckState.Checked else QtCore.Qt.CheckState.Checked
+                        it.setCheckState(new_state)
+            update_file_count_lbl()
+
+        btn_select_all.clicked.connect(lambda: set_all_files(QtCore.Qt.CheckState.Checked))
+        btn_deselect_all.clicked.connect(lambda: set_all_files(QtCore.Qt.CheckState.Unchecked))
+        btn_invert.clicked.connect(invert_files)
 
         def filter_captured_files(text):
             query = text.lower()
-            for row in range(table_files.rowCount()):
-                it = table_files.item(row, 0)
-                table_files.setRowHidden(row, not (it and query in it.text().lower()))
+            for row in range(self.table_files.rowCount()):
+                it = self.table_files.item(row, 0)
+                self.table_files.setRowHidden(row, not (it and query in it.text().lower()))
 
         txt_search.textChanged.connect(filter_captured_files)
-        tf_layout.addWidget(table_files)
+        tf_layout.addWidget(self.table_files)
 
         # File actions
         f_actions = QtWidgets.QHBoxLayout()
-        lbl_cnt = QtWidgets.QLabel(f"Total: {len(raw_files)} archivo(s) capturados.")
-        lbl_cnt.setObjectName("SecondaryAccentLabel")
-        f_actions.addWidget(lbl_cnt)
+        self.lbl_files_cnt = QtWidgets.QLabel(f"Seleccionados: {len(raw_files)} de {len(raw_files)} archivos.")
+        self.lbl_files_cnt.setObjectName("SecondaryAccentLabel")
+        f_actions.addWidget(self.lbl_files_cnt)
         f_actions.addStretch()
+
+        def update_file_count_lbl():
+            chk = 0
+            for r in range(self.table_files.rowCount()):
+                it = self.table_files.item(r, 0)
+                if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                    chk += 1
+            self.lbl_files_cnt.setText(f"Seleccionados: {chk} de {self.table_files.rowCount()} archivos.")
+
+        self.table_files.itemChanged.connect(lambda it: update_file_count_lbl() if it.column() == 0 else None)
 
         btn_open = QtWidgets.QPushButton("Abrir Carpeta")
         btn_open.setIcon(get_system_icon("folder-open", "📂"))
         def open_cap_folder():
-            rows = table_files.selectionModel().selectedRows()
+            rows = self.table_files.selectionModel().selectedRows()
             if rows:
-                p = table_files.item(rows[0].row(), 0).text()
+                p = self.table_files.item(rows[0].row(), 0).text()
                 target = p if os.path.isdir(p) else os.path.dirname(p)
                 if os.path.exists(target):
                     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
@@ -2070,34 +2353,100 @@ class ManualCaptureReviewDialog(QtWidgets.QDialog):
 
         tabs.addTab(tab_files, get_system_icon("folder", "📁"), f"Archivos ({len(raw_files)})")
 
-        # Tab 2: Registry
+        # Tab 2: Registry with Checkboxes
         tab_reg = QtWidgets.QWidget()
         tr_layout = QtWidgets.QVBoxLayout(tab_reg)
         tr_layout.setContentsMargins(6, 8, 6, 6)
 
-        txt_reg = QtWidgets.QPlainTextEdit()
-        txt_reg.setReadOnly(True)
-        reg_lines = self.diff.get("new_reg_lines", [])
-        if reg_lines:
-            txt_reg.setPlainText("\n".join(reg_lines))
-        else:
-            txt_reg.setPlainText("; No se generaron modificaciones en el registro durante esta sesión de captura.")
+        reg_sel_bar = QtWidgets.QHBoxLayout()
+        txt_reg_search = QtWidgets.QLineEdit()
+        txt_reg_search.setPlaceholderText("🔍 Filtrar entradas de registro...")
+        txt_reg_search.setClearButtonEnabled(True)
 
-        tr_layout.addWidget(txt_reg)
+        btn_select_all_r = QtWidgets.QPushButton("☑️ Marcar Todos")
+        btn_deselect_all_r = QtWidgets.QPushButton("⬜ Desmarcar Todos")
+        btn_invert_r = QtWidgets.QPushButton("🔄 Invertir")
+
+        reg_sel_bar.addWidget(txt_reg_search)
+        reg_sel_bar.addWidget(btn_select_all_r)
+        reg_sel_bar.addWidget(btn_deselect_all_r)
+        reg_sel_bar.addWidget(btn_invert_r)
+        tr_layout.addLayout(reg_sel_bar)
+
+        self.table_reg = QtWidgets.QTableWidget()
+        self.table_reg.setColumnCount(2)
+        self.table_reg.setHorizontalHeaderLabels(["[☑] Entrada de Registro Capturada", "Tipo"])
+        self.table_reg.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self.table_reg.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        self.table_reg.setAlternatingRowColors(True)
+
+        raw_reg = self.diff.get("new_reg_lines", [])
+        self.table_reg.setRowCount(len(raw_reg))
+        for r_idx, r_line in enumerate(raw_reg):
+            line_str = r_line.strip()
+            r_type = "Sección de Clave" if line_str.startswith("[") and line_str.endswith("]") else "Valor de Registro"
+            it_r = QtWidgets.QTableWidgetItem(line_str)
+            it_r.setFlags(QtCore.Qt.ItemFlag.ItemIsUserCheckable | QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            it_r.setCheckState(QtCore.Qt.CheckState.Checked)
+            it_r.setData(QtCore.Qt.ItemDataRole.UserRole, r_line)
+
+            it_t = QtWidgets.QTableWidgetItem(r_type)
+            self.table_reg.setItem(r_idx, 0, it_r)
+            self.table_reg.setItem(r_idx, 1, it_t)
+
+        def set_all_reg(state):
+            for row in range(self.table_reg.rowCount()):
+                if not self.table_reg.isRowHidden(row):
+                    it = self.table_reg.item(row, 0)
+                    if it:
+                        it.setCheckState(state)
+            update_reg_count_lbl()
+
+        def invert_reg():
+            for row in range(self.table_reg.rowCount()):
+                if not self.table_reg.isRowHidden(row):
+                    it = self.table_reg.item(row, 0)
+                    if it:
+                        new_state = QtCore.Qt.CheckState.Unchecked if it.checkState() == QtCore.Qt.CheckState.Checked else QtCore.Qt.CheckState.Checked
+                        it.setCheckState(new_state)
+            update_reg_count_lbl()
+
+        btn_select_all_r.clicked.connect(lambda: set_all_reg(QtCore.Qt.CheckState.Checked))
+        btn_deselect_all_r.clicked.connect(lambda: set_all_reg(QtCore.Qt.CheckState.Unchecked))
+        btn_invert_r.clicked.connect(invert_reg)
+
+        def filter_captured_reg(text):
+            query = text.lower()
+            for row in range(self.table_reg.rowCount()):
+                it = self.table_reg.item(row, 0)
+                self.table_reg.setRowHidden(row, not (it and query in it.text().lower()))
+
+        txt_reg_search.textChanged.connect(filter_captured_reg)
+        tr_layout.addWidget(self.table_reg)
 
         r_actions = QtWidgets.QHBoxLayout()
-        lbl_rcnt = QtWidgets.QLabel(f"Total: {len(reg_lines)} línea(s) de registro capturadas.")
-        lbl_rcnt.setObjectName("SecondaryAccentLabel")
-        r_actions.addWidget(lbl_rcnt)
+        self.lbl_reg_cnt = QtWidgets.QLabel(f"Seleccionadas: {len(raw_reg)} de {len(raw_reg)} líneas.")
+        self.lbl_reg_cnt.setObjectName("SecondaryAccentLabel")
+        r_actions.addWidget(self.lbl_reg_cnt)
         r_actions.addStretch()
+
+        def update_reg_count_lbl():
+            chk = 0
+            for r in range(self.table_reg.rowCount()):
+                it = self.table_reg.item(r, 0)
+                if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                    chk += 1
+            self.lbl_reg_cnt.setText(f"Seleccionadas: {chk} de {self.table_reg.rowCount()} líneas.")
+
+        self.table_reg.itemChanged.connect(lambda it: update_reg_count_lbl() if it.column() == 0 else None)
 
         btn_copy_r = QtWidgets.QPushButton("Copiar Registro")
         btn_copy_r.setIcon(get_system_icon("edit-copy", "📋"))
-        btn_copy_r.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(txt_reg.toPlainText()), QtWidgets.QMessageBox.information(self, "Copiado", "Registro copiado al portapapeles.")))
+        btn_copy_r.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText("\n".join(raw_reg)), QtWidgets.QMessageBox.information(self, "Copiado", "Registro copiado al portapapeles.")))
         r_actions.addWidget(btn_copy_r)
         tr_layout.addLayout(r_actions)
 
-        tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), f"Registro ({len(reg_lines)})")
+        tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), f"Registro ({len(raw_reg)})")
 
         layout.addWidget(tabs)
 
@@ -2141,7 +2490,32 @@ class ManualCaptureReviewDialog(QtWidgets.QDialog):
         if not target:
             QtWidgets.QMessageBox.warning(self, "Nombre Requerido", "Por favor ingresa o selecciona el nombre del plugin al que deseas asignar estos cambios.")
             return
+
+        checked_files = []
+        for r in range(self.table_files.rowCount()):
+            it = self.table_files.item(r, 0)
+            if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                fp = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                if fp:
+                    checked_files.append(fp)
+
+        checked_reg = []
+        for r in range(self.table_reg.rowCount()):
+            it = self.table_reg.item(r, 0)
+            if it and it.checkState() == QtCore.Qt.CheckState.Checked:
+                r_line = it.data(QtCore.Qt.ItemDataRole.UserRole)
+                if r_line:
+                    checked_reg.append(r_line)
+
+        if not checked_files and not checked_reg:
+            QtWidgets.QMessageBox.warning(self, "Sin Selección", "No has marcado ningún archivo ni entrada de registro para asignar. Marca al menos un elemento o presiona 'Descartar Captura'.")
+            return
+
         self.selected_target = target
+        self.filtered_diff = {
+            "new_files": checked_files,
+            "new_reg_lines": checked_reg
+        }
         self.accept()
 
 
@@ -2668,6 +3042,10 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
 
         if review_dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             item = review_dlg.selected_target
+            diff_to_save = getattr(review_dlg, "filtered_diff", diff)
+            num_saved_files = len(diff_to_save.get("new_files", []))
+            num_saved_regs = len(diff_to_save.get("new_reg_lines", []))
+
             if item:
                 tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
                 os.makedirs(tracker_dir, exist_ok=True)
@@ -2676,9 +3054,9 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 receipt_data = {
                     "installer": "Manual Patch/Crack/License",
                     "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "new_files": diff["new_files"],
-                    "reg_lines_count": num_regs,
-                    "reg_diff": diff["new_reg_lines"]
+                    "new_files": diff_to_save.get("new_files", []),
+                    "reg_lines_count": num_saved_regs,
+                    "reg_diff": diff_to_save.get("new_reg_lines", [])
                 }
                 with open(receipt_path, "w", encoding="utf-8") as rpf:
                     json.dump(receipt_data, rpf, indent=2)
@@ -2686,7 +3064,7 @@ class VSTInstallerApp(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(
                     self, 
                     "¡ADN Inyectado con Éxito!", 
-                    f"Los {num_files} archivo(s) y {num_regs} línea(s) de registro fueron inyectados en el ADN de '{item}'.\n\n"
+                    f"Los {num_saved_files} archivo(s) seleccionados y {num_saved_regs} línea(s) de registro fueron inyectados en el ADN de '{item}'.\n\n"
                     "Al exportar a .vstpack, tus parches, librerías y licencias irán incluidos automáticamente."
                 )
 
