@@ -1465,21 +1465,21 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         if self.parent() and hasattr(self.parent(), "refresh_installed_ecosystem"):
             self.parent().refresh_installed_ecosystem()
 
-    def remove_file_from_dna(self, file_path):
-        if not file_path:
+    def remove_multiple_files_from_dna(self, file_paths):
+        if not file_paths:
             return
         p_name = self.product.get("name", "Plugin") if self.product else "Plugin"
-        fname = os.path.basename(file_path)
         confirm = QtWidgets.QMessageBox.question(
             self,
-            "Desvincular Archivo del ADN",
-            f"¿Deseas desvincular el archivo:\n\n{file_path}\n\ndel ADN de '{p_name}'?\n\n"
-            "Nota: El archivo físico se conservará intacto en tu disco. Solo se quitará del tracking y de futuras exportaciones a .vstpack.",
+            "Desvincular Archivos del ADN",
+            f"¿Deseas desvincular los {len(file_paths)} archivo(s) seleccionados del ADN de '{p_name}'?\n\n"
+            "Nota: Los archivos físicos se conservarán intactos en tu disco. Solo se quitarán del tracking y de futuras exportaciones a .vstpack.",
             QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
         )
         if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
             return
 
+        to_remove_set = set(file_paths)
         tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
         modified_count = 0
         if os.path.isdir(tracker_dir):
@@ -1489,16 +1489,151 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                     try:
                         with open(rpath, "r", encoding="utf-8") as rf_fd:
                             rdata = json.load(rf_fd)
-                        if file_path in rdata.get("new_files", []):
-                            rdata["new_files"].remove(file_path)
+                        orig_files = rdata.get("new_files", [])
+                        new_files = [f for f in orig_files if f not in to_remove_set]
+                        if len(new_files) != len(orig_files):
+                            rdata["new_files"] = new_files
                             with open(rpath, "w", encoding="utf-8") as rf_fd:
                                 json.dump(rdata, rf_fd, indent=2)
                             modified_count += 1
                     except Exception:
                         pass
 
-        QtWidgets.QMessageBox.information(self, "Archivo Desvinculado", f"El archivo '{fname}' fue desvinculado del ADN en {modified_count} recibo(s).")
+        QtWidgets.QMessageBox.information(self, "Archivos Desvinculados", f"Se desvincularon {len(file_paths)} archivo(s) del ADN en {modified_count} recibo(s).")
         self.refresh_from_product()
+
+    def remove_multiple_from_dna(self, selected_items):
+        if not selected_items:
+            return
+
+        files_to_remove = set()
+        receipts_to_remove = set()
+        reg_lines_to_remove = set()
+
+        for item in selected_items:
+            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(meta, dict):
+                m_type = meta.get("type")
+                if m_type == "receipt":
+                    receipts_to_remove.add(meta.get("filename"))
+                elif m_type == "file":
+                    files_to_remove.add((meta.get("filename"), meta.get("path")))
+                elif m_type == "reg_line":
+                    reg_lines_to_remove.add((meta.get("filename"), meta.get("line")))
+                elif m_type == "files_category":
+                    for c_idx in range(item.childCount()):
+                        ch = item.child(c_idx)
+                        ch_meta = ch.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                        if isinstance(ch_meta, dict) and ch_meta.get("path"):
+                            files_to_remove.add((ch_meta.get("filename"), ch_meta.get("path")))
+                elif m_type == "reg_category":
+                    for c_idx in range(item.childCount()):
+                        ch = item.child(c_idx)
+                        ch_meta = ch.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                        if isinstance(ch_meta, dict) and ch_meta.get("line"):
+                            reg_lines_to_remove.add((ch_meta.get("filename"), ch_meta.get("line")))
+
+        total_elements = len(files_to_remove) + len(reg_lines_to_remove) + len(receipts_to_remove)
+        if total_elements == 0:
+            QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona uno o varios recibos, archivos o líneas de registro para desvincular.")
+            return
+
+        p_name = self.product.get("name", "Plugin") if self.product else "Plugin"
+        desc_parts = []
+        if receipts_to_remove:
+            desc_parts.append(f"• {len(receipts_to_remove)} recibo(s) completo(s)")
+        if files_to_remove:
+            desc_parts.append(f"• {len(files_to_remove)} archivo(s) individual(es)")
+        if reg_lines_to_remove:
+            desc_parts.append(f"• {len(reg_lines_to_remove)} entrada(s) de registro")
+
+        confirm_msg = (
+            f"¿Deseas desvincular del ADN de '{p_name}' los siguientes {total_elements} elementos seleccionados?\n\n"
+            + "\n".join(desc_parts) + "\n\n"
+            "Nota: Los archivos físicos en tu disco y el registro de Wine permanecerán intactos; "
+            "solo se desvincularán del ADN y de futuras exportaciones a .vstpack."
+        )
+
+        confirm = QtWidgets.QMessageBox.question(
+            self,
+            "Desvincular Múltiples Elementos del ADN",
+            confirm_msg,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
+        if confirm != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+        if not os.path.isdir(tracker_dir):
+            return
+
+        # 1. Delete full receipts
+        deleted_receipts_count = 0
+        for rf_name in receipts_to_remove:
+            rpath = os.path.join(tracker_dir, rf_name)
+            if os.path.isfile(rpath):
+                try:
+                    os.remove(rpath)
+                    deleted_receipts_count += 1
+                except Exception:
+                    pass
+
+        # 2. Modify individual files & reg lines in remaining receipts
+        files_by_receipt = {}
+        for rf_name, fp in files_to_remove:
+            if rf_name not in receipts_to_remove:
+                files_by_receipt.setdefault(rf_name, set()).add(fp)
+
+        reg_by_receipt = {}
+        for rf_name, rline in reg_lines_to_remove:
+            if rf_name not in receipts_to_remove:
+                reg_by_receipt.setdefault(rf_name, set()).add(rline)
+
+        all_target_receipts = set(files_by_receipt.keys()).union(set(reg_by_receipt.keys()))
+        modified_receipts_count = 0
+
+        for rf_name in all_target_receipts:
+            rpath = os.path.join(tracker_dir, rf_name)
+            if os.path.isfile(rpath):
+                try:
+                    with open(rpath, "r", encoding="utf-8") as rf_fd:
+                        rdata = json.load(rf_fd)
+
+                    modified = False
+                    if rf_name in files_by_receipt:
+                        to_del = files_by_receipt[rf_name]
+                        new_files_list = [f for f in rdata.get("new_files", []) if f not in to_del]
+                        if len(new_files_list) != len(rdata.get("new_files", [])):
+                            rdata["new_files"] = new_files_list
+                            modified = True
+
+                    if rf_name in reg_by_receipt:
+                        to_del_r = reg_by_receipt[rf_name]
+                        new_reg_list = [r for r in rdata.get("reg_diff", []) if r not in to_del_r]
+                        if len(new_reg_list) != len(rdata.get("reg_diff", [])):
+                            rdata["reg_diff"] = new_reg_list
+                            rdata["reg_lines_count"] = len(new_reg_list)
+                            modified = True
+
+                    if modified:
+                        with open(rpath, "w", encoding="utf-8") as rf_fd:
+                            json.dump(rdata, rf_fd, indent=2)
+                        modified_receipts_count += 1
+                except Exception:
+                    pass
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "Desvinculación Completada",
+            f"Se desvincularon correctamente los elementos seleccionados.\n\n"
+            f"• Recibos eliminados: {deleted_receipts_count}\n"
+            f"• Recibos actualizados: {modified_receipts_count}"
+        )
+        self.refresh_from_product()
+
+    def remove_file_from_dna(self, file_path):
+        if file_path:
+            self.remove_multiple_files_from_dna([file_path])
 
     def remove_receipt_from_dna(self, receipt_filename):
         if not receipt_filename:
@@ -1619,6 +1754,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         table_files.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         table_files.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.Interactive)
         table_files.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        table_files.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         table_files.setAlternatingRowColors(True)
 
         table_files.setRowCount(len(files))
@@ -1650,29 +1786,40 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         # Context menu for Table Files
         table_files.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         def show_files_menu(pos):
-            item = table_files.itemAt(pos)
-            if not item:
+            selected_rows = table_files.selectionModel().selectedRows()
+            if not selected_rows:
                 return
-            row = item.row()
-            table_files.selectRow(row)
-            abs_fp = table_files.item(row, 3).text()
 
             menu = QtWidgets.QMenu(self)
-            act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
-            act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
-            menu.addSeparator()
-            act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)")
+            if len(selected_rows) == 1:
+                abs_fp = table_files.item(selected_rows[0].row(), 3).text()
+                act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
+                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
+                menu.addSeparator()
+                act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)")
 
-            action = menu.exec(table_files.viewport().mapToGlobal(pos))
-            if action == act_open:
-                target = abs_fp if os.path.isdir(abs_fp) else os.path.dirname(abs_fp)
-                if os.path.exists(target):
-                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
-            elif action == act_copy:
-                QtWidgets.QApplication.clipboard().setText(abs_fp)
-                QtWidgets.QMessageBox.information(self, "Copiado", f"Ruta copiada al portapapeles:\n{abs_fp}")
-            elif action == act_unlink:
-                self.remove_file_from_dna(abs_fp)
+                action = menu.exec(table_files.viewport().mapToGlobal(pos))
+                if action == act_open:
+                    target = abs_fp if os.path.isdir(abs_fp) else os.path.dirname(abs_fp)
+                    if os.path.exists(target):
+                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+                elif action == act_copy:
+                    QtWidgets.QApplication.clipboard().setText(abs_fp)
+                    QtWidgets.QMessageBox.information(self, "Copiado", f"Ruta copiada al portapapeles:\n{abs_fp}")
+                elif action == act_unlink:
+                    self.remove_multiple_files_from_dna([abs_fp])
+            else:
+                paths = [table_files.item(r.row(), 3).text() for r in selected_rows if table_files.item(r.row(), 3)]
+                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), f"Copiar {len(paths)} Rutas Absolutas")
+                menu.addSeparator()
+                act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Quitar los {len(paths)} Archivos Seleccionados del ADN...")
+
+                action = menu.exec(table_files.viewport().mapToGlobal(pos))
+                if action == act_copy:
+                    QtWidgets.QApplication.clipboard().setText("\n".join(paths))
+                    QtWidgets.QMessageBox.information(self, "Copiado", f"Se copiaron {len(paths)} rutas al portapapeles.")
+                elif action == act_unlink:
+                    self.remove_multiple_files_from_dna(paths)
 
         table_files.customContextMenuRequested.connect(show_files_menu)
         tf_layout.addWidget(table_files)
@@ -1714,18 +1861,18 @@ class ProductDetailsDialog(QtWidgets.QDialog):
 
         btn_copy_paths.clicked.connect(copy_paths_action)
 
-        btn_unlink_file = QtWidgets.QPushButton("Quitar del ADN")
+        btn_unlink_file = QtWidgets.QPushButton("Quitar Seleccionados del ADN")
         btn_unlink_file.setIcon(get_system_icon("edit-delete", "🗑️"))
-        btn_unlink_file.setToolTip("Quita el archivo seleccionado del ADN y de los paquetes .vstpack (sin borrar el archivo de disco).")
-        def unlink_selected_file():
+        btn_unlink_file.setToolTip("Quita los archivos seleccionados del ADN y de los paquetes .vstpack (sin borrar archivos de disco).")
+        def unlink_selected_files():
             rows = table_files.selectionModel().selectedRows()
             if rows:
-                abs_path = table_files.item(rows[0].row(), 3).text()
-                self.remove_file_from_dna(abs_path)
+                paths = [table_files.item(r.row(), 3).text() for r in rows if table_files.item(r.row(), 3)]
+                self.remove_multiple_files_from_dna(paths)
             else:
-                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un archivo de la tabla para desvincularlo del ADN.")
+                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona uno o más archivos de la tabla para desvincularlos del ADN.")
 
-        btn_unlink_file.clicked.connect(unlink_selected_file)
+        btn_unlink_file.clicked.connect(unlink_selected_files)
 
         f_actions.addWidget(btn_open_folder)
         f_actions.addWidget(btn_copy_paths)
@@ -1786,6 +1933,7 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         tree_hist.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
         tree_hist.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         tree_hist.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tree_hist.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         tree_hist.setAlternatingRowColors(True)
 
         drive_c = get_drive_c_path(self.wine_prefix)
@@ -1908,53 +2056,79 @@ class ProductDetailsDialog(QtWidgets.QDialog):
         # Context menu for History Tree
         tree_hist.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         def show_hist_tree_menu(pos):
-            item = tree_hist.itemAt(pos)
-            if not item:
-                return
-            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            if not isinstance(meta, dict):
+            selected_items = tree_hist.selectedItems()
+            if not selected_items:
                 return
 
             menu = QtWidgets.QMenu(self)
-            m_type = meta.get("type")
+            if len(selected_items) == 1:
+                item = selected_items[0]
+                meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(meta, dict):
+                    m_type = meta.get("type")
+                    if m_type == "receipt":
+                        rf_name = meta.get("filename")
+                        act_del_rc = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Eliminar Recibo '{rf_name}' del ADN...")
+                        menu.addSeparator()
+                        act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Nombre de Recibo")
+                        action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                        if action == act_del_rc:
+                            self.remove_multiple_from_dna([item])
+                        elif action == act_copy:
+                            QtWidgets.QApplication.clipboard().setText(rf_name)
 
-            if m_type == "receipt":
-                rf_name = meta.get("filename")
-                act_del_rc = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Eliminar Recibo '{rf_name}' del ADN...")
-                menu.addSeparator()
-                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Nombre de Recibo")
-                action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
-                if action == act_del_rc:
-                    self.remove_receipt_from_dna(rf_name)
-                elif action == act_copy:
-                    QtWidgets.QApplication.clipboard().setText(rf_name)
+                    elif m_type == "file":
+                        fp = meta.get("path")
+                        act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
+                        act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
+                        menu.addSeparator()
+                        act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)...")
+                        action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                        if action == act_open:
+                            target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                            if os.path.exists(target):
+                                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+                        elif action == act_copy:
+                            QtWidgets.QApplication.clipboard().setText(fp)
+                        elif action == act_unlink:
+                            self.remove_multiple_from_dna([item])
 
-            elif m_type == "file":
-                fp = meta.get("path")
-                act_open = menu.addAction(get_system_icon("folder-open", "📂"), "Abrir Carpeta Contenedora")
-                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Ruta Absoluta")
-                menu.addSeparator()
-                act_unlink = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar este Archivo del ADN (No borrará de disco)...")
-                action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
-                if action == act_open:
-                    target = fp if os.path.isdir(fp) else os.path.dirname(fp)
-                    if os.path.exists(target):
-                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
-                elif action == act_copy:
-                    QtWidgets.QApplication.clipboard().setText(fp)
-                elif action == act_unlink:
-                    self.remove_file_from_dna(fp)
+                    elif m_type == "reg_line":
+                        r_line = meta.get("line")
+                        act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Entrada de Registro")
+                        menu.addSeparator()
+                        act_del_reg = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar esta Entrada de Registro del ADN...")
+                        action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                        if action == act_copy:
+                            QtWidgets.QApplication.clipboard().setText(r_line)
+                        elif action == act_del_reg:
+                            self.remove_multiple_from_dna([item])
 
-            elif m_type == "reg_line":
-                r_line = meta.get("line")
-                act_copy = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Entrada de Registro")
+                    elif m_type in ["files_category", "reg_category"]:
+                        act_del_cat = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Quitar todo este grupo ({item.childCount()} elementos) del ADN...")
+                        action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
+                        if action == act_del_cat:
+                            self.remove_multiple_from_dna([item])
+            else:
+                act_unlink_batch = menu.addAction(get_system_icon("edit-delete", "🗑️"), f"Quitar los {len(selected_items)} Elementos Seleccionados del ADN...")
                 menu.addSeparator()
-                act_del_reg = menu.addAction(get_system_icon("edit-delete", "🗑️"), "Quitar esta Entrada de Registro del ADN...")
+                act_copy_batch = menu.addAction(get_system_icon("edit-copy", "📋"), "Copiar Rutas / Textos Seleccionados")
+
                 action = menu.exec(tree_hist.viewport().mapToGlobal(pos))
-                if action == act_copy:
-                    QtWidgets.QApplication.clipboard().setText(r_line)
-                elif action == act_del_reg:
-                    self.remove_reg_line_from_dna(r_line)
+                if action == act_unlink_batch:
+                    self.remove_multiple_from_dna(selected_items)
+                elif action == act_copy_batch:
+                    texts = []
+                    for it in selected_items:
+                        meta = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                        if isinstance(meta, dict) and meta.get("path"):
+                            texts.append(meta["path"])
+                        elif isinstance(meta, dict) and meta.get("line"):
+                            texts.append(meta["line"])
+                        else:
+                            texts.append(it.text(0))
+                    QtWidgets.QApplication.clipboard().setText("\n".join(texts))
+                    QtWidgets.QMessageBox.information(self, "Copiado", f"Se copiaron {len(texts)} elementos al portapapeles.")
 
         tree_hist.customContextMenuRequested.connect(show_hist_tree_menu)
         th_layout.addWidget(tree_hist)
@@ -1983,42 +2157,35 @@ class ProductDetailsDialog(QtWidgets.QDialog):
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(tracker_dir))
         btn_open_hist_folder.clicked.connect(open_selected_hist_file)
 
-        btn_unlink_hist_item = QtWidgets.QPushButton("Quitar del ADN")
+        btn_unlink_hist_item = QtWidgets.QPushButton("Quitar Seleccionados del ADN")
         btn_unlink_hist_item.setIcon(get_system_icon("edit-delete", "🗑️"))
-        btn_unlink_hist_item.setToolTip("Quita el elemento seleccionado (recibo completo, archivo o registro) del ADN del plugin.")
-        def unlink_selected_tree_item():
-            item = tree_hist.currentItem()
-            if not item:
-                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona un recibo, archivo o línea de registro para desvincular.")
+        btn_unlink_hist_item.setToolTip("Quita los elementos seleccionados (recibos completos, archivos o registros) del ADN del plugin.")
+        def unlink_selected_tree_items():
+            selected_items = tree_hist.selectedItems()
+            if not selected_items:
+                QtWidgets.QMessageBox.information(self, "Seleccionar", "Selecciona uno o más elementos en el árbol (con Ctrl o Shift) para desvincularlos del ADN.")
                 return
-            meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-            if isinstance(meta, dict):
-                m_type = meta.get("type")
-                if m_type == "receipt":
-                    self.remove_receipt_from_dna(meta.get("filename"))
-                elif m_type == "file":
-                    self.remove_file_from_dna(meta.get("path"))
-                elif m_type == "reg_line":
-                    self.remove_reg_line_from_dna(meta.get("line"))
-                else:
-                    QtWidgets.QMessageBox.information(self, "Selección", "Selecciona un recibo individual o archivo para quitar.")
+            self.remove_multiple_from_dna(selected_items)
 
-        btn_unlink_hist_item.clicked.connect(unlink_selected_tree_item)
+        btn_unlink_hist_item.clicked.connect(unlink_selected_tree_items)
 
         btn_copy_hist_item = QtWidgets.QPushButton("Copiar Texto / Rutas")
         btn_copy_hist_item.setIcon(get_system_icon("edit-copy", "📋"))
         def copy_selected_hist_text():
-            item = tree_hist.currentItem()
-            if item:
-                meta = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
-                if isinstance(meta, dict) and meta.get("type") == "file":
-                    text_to_copy = meta.get("path", "")
-                elif isinstance(meta, dict) and meta.get("type") == "reg_line":
-                    text_to_copy = meta.get("line", "")
+            selected_items = tree_hist.selectedItems()
+            if not selected_items:
+                return
+            texts = []
+            for it in selected_items:
+                meta = it.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if isinstance(meta, dict) and meta.get("path"):
+                    texts.append(meta["path"])
+                elif isinstance(meta, dict) and meta.get("line"):
+                    texts.append(meta["line"])
                 else:
-                    text_to_copy = item.text(0)
-                QtWidgets.QApplication.clipboard().setText(text_to_copy)
-                QtWidgets.QMessageBox.information(self, "Copiado", f"Copiado al portapapeles:\n{text_to_copy}")
+                    texts.append(it.text(0))
+            QtWidgets.QApplication.clipboard().setText("\n".join(texts))
+            QtWidgets.QMessageBox.information(self, "Copiado", f"Copiado al portapapeles:\n" + "\n".join(texts[:10]) + (f"\n... y {len(texts)-10} más" if len(texts) > 10 else ""))
         btn_copy_hist_item.clicked.connect(copy_selected_hist_text)
 
         hist_actions.addWidget(btn_open_hist_folder)
