@@ -784,6 +784,93 @@ class InstallWorker(QtCore.QThread):
         self.finished.emit()
 
 
+def extract_wine_registry_keys(wine_prefix: str, keys_to_export: set, receipts: list = None, is_windows: bool = False) -> str:
+    """Extracts Windows Registry keys cleanly in pure Python from Wine's user.reg and system.reg,
+    and merges any captured diffs from receipts, with ZERO Wine GUI popups or processes."""
+    output_lines = ["Windows Registry Editor Version 5.00\n"]
+    seen_sections = set()
+
+    # 1. First add registry diffs from receipts
+    if receipts:
+        for r in receipts:
+            reg_diff = r.get("reg_diff", [])
+            if reg_diff:
+                for line in reg_diff:
+                    line_clean = line.strip()
+                    if line_clean.startswith("[") and line_clean.endswith("]"):
+                        sec_header = line_clean[1:-1]
+                        if not sec_header.startswith("HKEY_"):
+                            sec_header = f"HKEY_CURRENT_USER\\{sec_header}"
+                        sec_header = re.sub(r'\\+', r'\\', sec_header)
+                        if sec_header not in seen_sections:
+                            seen_sections.add(sec_header)
+                            output_lines.append(f"\n[{sec_header}]\n")
+                    elif line_clean and not line_clean.startswith("Windows Registry Editor"):
+                        output_lines.append(line + ("\n" if not line.endswith("\n") else ""))
+
+    if is_windows:
+        return "".join(output_lines)
+
+    # 2. Extract matching keys from user.reg (HKCU) and system.reg (HKLM)
+    user_reg = os.path.join(wine_prefix, "user.reg")
+    system_reg = os.path.join(wine_prefix, "system.reg")
+
+    def parse_and_extract(reg_path, default_hive):
+        if not os.path.isfile(reg_path):
+            return
+        
+        targets = [k.replace("/", "\\").lower() for k in keys_to_export if k]
+        section_matches = False
+        current_full_sec = None
+
+        def match_target(sec_l, target_key):
+            sub = target_key
+            if sub.startswith("software\\"):
+                sub = sub[len("software\\"):]
+            if not sub or sub in ["classes", "microsoft", "wine", "wow6432node"]:
+                return False
+            if sec_l == target_key or sec_l.startswith(target_key + "\\"):
+                return True
+            wow_target = f"software\\wow6432node\\{sub}"
+            if sec_l == wow_target or sec_l.startswith(wow_target + "\\"):
+                return True
+            return False
+
+        try:
+            with open(reg_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("[") and "]" in stripped:
+                        raw_sec = stripped[1:stripped.rfind("]")].replace("/", "\\")
+                        raw_sec_clean = raw_sec.split("]")[0].strip()
+                        current_full_sec = f"{default_hive}\\{raw_sec_clean}" if not raw_sec_clean.startswith("HKEY_") else raw_sec_clean
+                        current_full_sec = re.sub(r'\\+', r'\\', current_full_sec)
+                        sec_lower = raw_sec_clean.lower()
+
+                        section_matches = any(match_target(sec_lower, t) for t in targets)
+
+                        if section_matches:
+                            if current_full_sec not in seen_sections:
+                                seen_sections.add(current_full_sec)
+                                output_lines.append(f"\n[{current_full_sec}]\n")
+                            else:
+                                section_matches = False
+                    elif section_matches:
+                        if stripped.startswith("#") or stripped.startswith(";"):
+                            continue
+                        if stripped:
+                            output_lines.append(line if line.endswith("\n") else line + "\n")
+                        elif output_lines and output_lines[-1] != "\n":
+                            output_lines.append("\n")
+        except Exception:
+            pass
+
+    parse_and_extract(user_reg, "HKEY_CURRENT_USER")
+    parse_and_extract(system_reg, "HKEY_LOCAL_MACHINE")
+
+    return "".join(output_lines)
+
+
 def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_windows=False):
     temp_dir = tempfile.mkdtemp(prefix="vstpack_build_")
     try:
@@ -791,7 +878,7 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
         os.makedirs(drive_dest, exist_ok=True)
 
         manifest = {
-            "format_version": "2.0",
+            "version": "1.0",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "source_os": "Windows (Native)" if is_windows else "Linux (Wine)",
             "compatibility": ["Linux (Instrumentarium)", "Windows 10/11 (Native)"],
@@ -976,44 +1063,9 @@ def create_vstpack_bundle(target_archive, products, wine_prefix, wine_root, is_w
 
         # Export Registry
         reg_file = os.path.join(temp_dir, "registry.reg")
+        reg_content = extract_wine_registry_keys(wine_prefix, keys_to_export, receipts, is_windows)
         with open(reg_file, "w", encoding="utf-8") as rf:
-            rf.write("Windows Registry Editor Version 5.00\n\n")
-
-        if not is_windows and wine_root:
-            wine_bin = os.path.join(wine_root, "bin", "wine")
-            env = os.environ.copy()
-            env["WINEPREFIX"] = wine_prefix
-            env["WINEDEBUG"] = "-all"
-
-            for base_key in keys_to_export:
-                k_clean = re.sub(r'[^a-zA-Z0-9_]', '_', base_key)
-                for hive in ["HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"]:
-                    full_key = f"{hive}\\{base_key}"
-                    sub_reg_name = f"reg_{k_clean}_{hive}.reg"
-                    try:
-                        subprocess.run(
-                            [wine_bin, "regedit", "/E", sub_reg_name, full_key],
-                            env=env,
-                            cwd=temp_dir,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=3
-                        )
-                    except Exception:
-                        pass
-
-                    sub_reg = os.path.join(temp_dir, sub_reg_name)
-                    if os.path.isfile(sub_reg) and os.path.getsize(sub_reg) > 50:
-                        try:
-                            with open(sub_reg, "r", encoding="utf-16") as srf:
-                                lines = srf.readlines()
-                        except UnicodeError:
-                            with open(sub_reg, "r", encoding="utf-8", errors="ignore") as srf:
-                                lines = srf.readlines()
-
-                        content = "".join([l for l in lines if not l.strip().startswith("Windows Registry Editor")])
-                        with open(reg_file, "a", encoding="utf-8") as rf:
-                            rf.write(f"\n; --- {full_key} ---\n" + content + "\n")
+            rf.write(reg_content)
 
         # Write manifest.json
         with open(os.path.join(temp_dir, "manifest.json"), "w", encoding="utf-8") as mf:
