@@ -1608,31 +1608,182 @@ class ProductDetailsDialog(QtWidgets.QDialog):
 
         tabs.addTab(tab_reg, get_system_icon("preferences-system", "🔑"), f"Registro ({len(reg_lines)})")
 
-        # Tab 3: Receipts / History
+        # Tab 3: Receipts / History Tree
         tab_hist = QtWidgets.QWidget()
         th_layout = QtWidgets.QVBoxLayout(tab_hist)
         th_layout.setContentsMargins(6, 8, 6, 6)
+        th_layout.setSpacing(8)
 
-        table_hist = QtWidgets.QTableWidget()
-        table_hist.setColumnCount(5)
-        table_hist.setHorizontalHeaderLabels(["Recibo / Evento", "Tipo / Origen", "Fecha de Captura", "Archivos Registrados", "Líneas de Reg"])
-        table_hist.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
-        table_hist.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_hist.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_hist.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_hist.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
-        table_hist.setAlternatingRowColors(True)
+        hist_top_bar = QtWidgets.QHBoxLayout()
+        txt_hist_search = QtWidgets.QLineEdit()
+        txt_hist_search.setPlaceholderText("🔍 Filtrar en el historial de ADN (archivos, claves de registro, eventos, fechas)...")
+        txt_hist_search.setClearButtonEnabled(True)
+        hist_top_bar.addWidget(txt_hist_search)
 
-        table_hist.setRowCount(len(receipts))
-        for r_idx, rc in enumerate(receipts):
+        btn_expand_all = QtWidgets.QPushButton("Desplegar Todo")
+        btn_expand_all.setIcon(get_system_icon("view-list-tree", "📂"))
+        btn_collapse_all = QtWidgets.QPushButton("Colapsar Todo")
+        btn_collapse_all.setIcon(get_system_icon("view-list-details", "📁"))
+        hist_top_bar.addWidget(btn_expand_all)
+        hist_top_bar.addWidget(btn_collapse_all)
+        th_layout.addLayout(hist_top_bar)
+
+        tree_hist = QtWidgets.QTreeWidget()
+        tree_hist.setHeaderLabels(["Evento / Recibo de ADN", "Tipo / Ubicación", "Tamaño / Detalle"])
+        tree_hist.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        tree_hist.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tree_hist.header().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        tree_hist.setAlternatingRowColors(True)
+
+        drive_c = get_drive_c_path(self.wine_prefix)
+
+        for rc in receipts:
             r_data = rc["data"]
-            table_hist.setItem(r_idx, 0, QtWidgets.QTableWidgetItem(rc["filename"]))
-            table_hist.setItem(r_idx, 1, QtWidgets.QTableWidgetItem(r_data.get("installer", "Desconocido")))
-            table_hist.setItem(r_idx, 2, QtWidgets.QTableWidgetItem(r_data.get("installed_at", "N/A")))
-            table_hist.setItem(r_idx, 3, QtWidgets.QTableWidgetItem(str(len(r_data.get("new_files", [])))))
-            table_hist.setItem(r_idx, 4, QtWidgets.QTableWidgetItem(str(r_data.get("reg_lines_count", len(r_data.get("reg_diff", []))))))
+            r_installer = r_data.get("installer", "Instalador / Parche")
+            r_date = r_data.get("installed_at", "N/A")
+            r_files = r_data.get("new_files", [])
+            r_reg = r_data.get("reg_diff", [])
+            rf_name = rc.get("filename", "receipt.json")
 
-        th_layout.addWidget(table_hist)
+            # Top-level node for the receipt
+            root_item = QtWidgets.QTreeWidgetItem(tree_hist)
+            root_item.setIcon(0, get_system_icon("document-save", "📜"))
+            root_item.setText(0, f"Recibo: {r_installer} ({rf_name})")
+            root_item.setText(1, "Evento Registrado")
+            root_item.setText(2, f"Fecha: {r_date}")
+            root_item.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.Bold))
+
+            # Child node 1: Files
+            files_node = QtWidgets.QTreeWidgetItem(root_item)
+            files_node.setIcon(0, get_system_icon("folder", "📁"))
+            files_node.setText(0, f"Archivos Registrados en este Evento ({len(r_files)})")
+            files_node.setText(1, "Lista de Archivos")
+            files_node.setText(2, f"{len(r_files)} archivos")
+            files_node.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.DemiBold))
+
+            for fp in r_files:
+                f_item = QtWidgets.QTreeWidgetItem(files_node)
+                rel = os.path.relpath(fp, drive_c) if not os.path.relpath(fp, drive_c).startswith("..") else fp
+                norm = fp.replace("\\", "/").lower()
+                if ".vst3" in norm:
+                    cat = "Binario VST3"
+                    f_item.setIcon(0, get_system_icon("audio-card", "🎹"))
+                elif ".dll" in norm:
+                    cat = "Binario VST2"
+                    f_item.setIcon(0, get_system_icon("application-x-executable", "⚙️"))
+                elif ".clap" in norm:
+                    cat = "Binario CLAP"
+                    f_item.setIcon(0, get_system_icon("audio-card", "🎹"))
+                elif "/documents/" in norm or "/documentos/" in norm:
+                    cat = "Presets / Librería"
+                    f_item.setIcon(0, get_system_icon("document-open", "📚"))
+                elif "/appdata/" in norm:
+                    cat = "Config / Licencia"
+                    f_item.setIcon(0, get_system_icon("preferences-system", "⚙️"))
+                else:
+                    cat = "Archivo de Soporte"
+                    f_item.setIcon(0, get_system_icon("text-x-generic", "📄"))
+
+                try:
+                    sz = format_file_size(os.path.getsize(fp)) if os.path.exists(fp) and not os.path.isdir(fp) else "N/A"
+                except Exception:
+                    sz = "N/A"
+
+                f_item.setText(0, rel)
+                f_item.setText(1, cat)
+                f_item.setText(2, sz)
+                f_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, fp)
+
+            # Child node 2: Registry
+            if r_reg:
+                reg_node = QtWidgets.QTreeWidgetItem(root_item)
+                reg_node.setIcon(0, get_system_icon("preferences-system", "🔑"))
+                reg_node.setText(0, f"Registro de Windows Capturado ({len(r_reg)} líneas)")
+                reg_node.setText(1, "Claves de Registro")
+                reg_node.setText(2, f"{len(r_reg)} líneas")
+                reg_node.setFont(0, QtGui.QFont("", -1, QtGui.QFont.Weight.DemiBold))
+
+                for r_line in r_reg:
+                    rl_item = QtWidgets.QTreeWidgetItem(reg_node)
+                    rl_item.setIcon(0, get_system_icon("text-plain", "🔑"))
+                    rl_item.setText(0, r_line.strip())
+                    rl_item.setText(1, "Entrada de Registro")
+                    rl_item.setText(2, "")
+
+        btn_expand_all.clicked.connect(tree_hist.expandAll)
+        btn_collapse_all.clicked.connect(tree_hist.collapseAll)
+
+        def filter_hist_tree(text):
+            query = text.lower()
+            for i in range(tree_hist.topLevelItemCount()):
+                root = tree_hist.topLevelItem(i)
+                root_match = query in root.text(0).lower() or query in root.text(2).lower()
+                any_child_match = False
+                for c_idx in range(root.childCount()):
+                    child = root.child(c_idx)
+                    child_match = query in child.text(0).lower() or query in child.text(1).lower()
+                    sub_child_match = False
+                    for sc_idx in range(child.childCount()):
+                        sc = child.child(sc_idx)
+                        sc_match = query in sc.text(0).lower() or query in sc.text(1).lower()
+                        sc.setHidden(not sc_match if query else False)
+                        if sc_match:
+                            sub_child_match = True
+                    child.setHidden(not (child_match or sub_child_match) if query else False)
+                    if child_match or sub_child_match:
+                        any_child_match = True
+                root.setHidden(not (root_match or any_child_match) if query else False)
+                if query and (root_match or any_child_match):
+                    root.setExpanded(True)
+
+        txt_hist_search.textChanged.connect(filter_hist_tree)
+
+        def on_tree_double_clicked(item, col):
+            fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+            if fp and os.path.exists(fp):
+                target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+
+        tree_hist.itemDoubleClicked.connect(on_tree_double_clicked)
+        th_layout.addWidget(tree_hist)
+
+        # Bottom actions for Tab 3
+        hist_actions = QtWidgets.QHBoxLayout()
+        lbl_hist_info = QtWidgets.QLabel(f"Total: {len(receipts)} sesión(es) de captura registradas.")
+        lbl_hist_info.setObjectName("SecondaryAccentLabel")
+        hist_actions.addWidget(lbl_hist_info)
+        hist_actions.addStretch()
+
+        btn_open_hist_folder = QtWidgets.QPushButton("Abrir Carpeta de Archivo")
+        btn_open_hist_folder.setIcon(get_system_icon("folder-open", "📂"))
+        def open_selected_hist_file():
+            item = tree_hist.currentItem()
+            if item:
+                fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                if fp and os.path.exists(fp):
+                    target = fp if os.path.isdir(fp) else os.path.dirname(fp)
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(target))
+                else:
+                    tracker_dir = os.path.join(self.wine_prefix, ".vst_tracker")
+                    if os.path.exists(tracker_dir):
+                        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(tracker_dir))
+        btn_open_hist_folder.clicked.connect(open_selected_hist_file)
+
+        btn_copy_hist_item = QtWidgets.QPushButton("Copiar Texto / Rutas")
+        btn_copy_hist_item.setIcon(get_system_icon("edit-copy", "📋"))
+        def copy_selected_hist_text():
+            item = tree_hist.currentItem()
+            if item:
+                fp = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+                text_to_copy = fp if fp else item.text(0)
+                QtWidgets.QApplication.clipboard().setText(text_to_copy)
+                QtWidgets.QMessageBox.information(self, "Copiado", f"Copiado al portapapeles:\n{text_to_copy}")
+        btn_copy_hist_item.clicked.connect(copy_selected_hist_text)
+
+        hist_actions.addWidget(btn_open_hist_folder)
+        hist_actions.addWidget(btn_copy_hist_item)
+        th_layout.addLayout(hist_actions)
+
         tabs.addTab(tab_hist, get_system_icon("history", "📜"), f"Historial ADN ({len(receipts)})")
 
         layout.addWidget(tabs)
